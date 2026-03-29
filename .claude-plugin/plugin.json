@@ -1,0 +1,19 @@
+{
+  "name": "taskpilot",
+  "description": "Spawn and manage long-running autonomous Claude Code sessions for background tasks",
+  "version": "0.1.0",
+  "author": {
+    "name": "Thatcher",
+    "url": "https://github.com/ThatcherT"
+  },
+  "repository": "https://github.com/ThatcherT/taskpilot",
+  "license": "MIT",
+  "keywords": ["agent", "autonomous", "background", "task", "tmux", "channel"],
+  "mcpServers": {
+    "taskpilot": {
+      "command": "python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server.py"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}"
+    }
+  }
+}
