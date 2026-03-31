@@ -71,9 +71,9 @@ The `operating_brief` parameter to `create_task` accepts a dict with:
 | `workflows` | list[str] | Ordered phases/steps |
 | `success_criteria` | list[str] | Completion conditions |
 | `boundaries` | list[str] | What NOT to do |
-| `capabilities` | list[str] | Required capabilities (auto-resolved via nov-hub) |
+| `capabilities` | list[str] | Required capabilities (auto-resolved via nov-dependency-resolver) |
 | `schedule` | str | Cron expression for recurring agents |
 
-Capabilities declared in the brief are automatically resolved to provider plugins via nov-hub at task creation time. The agent's CLAUDE.md is dynamically generated with sections for each declared capability.
+Capabilities declared in the brief are automatically resolved to provider plugins via nov-dependency-resolver at task creation time. The agent's CLAUDE.md is dynamically generated with sections for each declared capability.
 
 Environment variable `TASKPILOT_TASK_ID` is exported in the tmux session so capability plugins can scope their storage per-task.

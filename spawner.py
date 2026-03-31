@@ -178,7 +178,7 @@ If state.json exists, read it first to understand your previous progress, then c
 
 
 def resolve_capabilities(capabilities: list[str]) -> list[str]:
-    """Resolve capability names to installed plugin paths via nov-hub.
+    """Resolve capability names to installed plugin paths via nov-dependency-resolver.
 
     Returns:
         List of plugin directory paths for providers that match the declared capabilities.
@@ -186,8 +186,8 @@ def resolve_capabilities(capabilities: list[str]) -> list[str]:
     if not capabilities:
         return []
 
-    # Import nov-hub's resolver directly (same machine, avoid MCP overhead)
-    nov_hub_path = Path(__file__).parent.parent / "nov-hub"
+    # Import nov-dependency-resolver's resolver directly (same machine, avoid MCP overhead)
+    nov_hub_path = Path(__file__).parent.parent / "nov-dependency-resolver"
     if not nov_hub_path.exists():
         return []
 

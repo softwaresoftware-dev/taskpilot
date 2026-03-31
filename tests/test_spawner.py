@@ -133,8 +133,8 @@ class TestResolveCapabilities:
         assert spawner.resolve_capabilities([]) == []
 
     def test_missing_nov_hub(self, tmp_path):
-        """Should return empty list if nov-hub doesn't exist."""
+        """Should return empty list if nov-dependency-resolver doesn't exist."""
         with patch.object(spawner, 'PLUGIN_ROOT', tmp_path):
-            # tmp_path.parent / "nov-hub" won't exist
+            # tmp_path.parent / "nov-dependency-resolver" won't exist
             result = spawner.resolve_capabilities(["memory"])
             assert result == []

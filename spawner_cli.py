@@ -39,7 +39,7 @@ def main():
             if brief_path.exists():
                 operating_brief = json.loads(brief_path.read_text())
 
-        # Auto-resolve capability plugins via nov-hub
+        # Auto-resolve capability plugins via nov-dependency-resolver
         capabilities = operating_brief.get("capabilities", [])
         if capabilities:
             resolved = spawner.resolve_capabilities(capabilities)

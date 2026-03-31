@@ -26,7 +26,7 @@ Spawn a new autonomous agent session.
 
    For simple tasks, the brief can be minimal. For long-running business agents, fill out as much as makes sense.
 
-3. **Determine plugins needed.** Based on the task, identify which plugins the spawned session needs access to. Capabilities are auto-resolved via nov-hub — you only need to specify plugins that aren't covered by the capability system.
+3. **Determine plugins needed.** Based on the task, identify which plugins the spawned session needs access to. Capabilities are auto-resolved via nov-dependency-resolver — you only need to specify plugins that aren't covered by the capability system.
 
 4. **Create the task.** Call `create_task(name, description, plugins, operating_brief)` from the taskpilot MCP. The operating brief is a dict with keys: objectives, workflows, success_criteria, boundaries, capabilities, schedule.
 

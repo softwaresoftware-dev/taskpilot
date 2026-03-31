@@ -40,7 +40,7 @@ def create_task(
     plugins = plugins or []
     operating_brief = operating_brief or {}
 
-    # Auto-resolve capability plugins via nov-hub
+    # Auto-resolve capability plugins via nov-dependency-resolver
     capabilities = operating_brief.get("capabilities", [])
     if capabilities:
         resolved = spawner.resolve_capabilities(capabilities)

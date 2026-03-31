@@ -80,7 +80,7 @@ class TestCreateTaskIntegration:
             assert "## Objectives" not in md
 
     def test_capability_resolution_merges_plugins(self, db_path, tmp_path):
-        """Capabilities resolved by nov-hub are merged with explicit plugins."""
+        """Capabilities resolved by nov-dependency-resolver are merged with explicit plugins."""
         brief = {"capabilities": ["memory", "notification"]}
         with (
             patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
