@@ -135,7 +135,7 @@ class TestResolveCapabilities:
         marketplace = tmp_path / "marketplace.json"
         marketplace.write_text(json.dumps({"plugins": [
             {"name": "memory-file", "provides": ["memory"],
-             "source": {"source": "github", "repo": "ThatcherT/memory-file"},
+             "source": {"source": "github", "repo": "softwaresoftware-dev/memory-file"},
              "version": "0.1.0"},
         ]}))
         installed = tmp_path / "installed.json"
@@ -160,7 +160,7 @@ class TestResolveCapabilities:
             result = spawner.resolve_capabilities(["memory"])
             args = mock_run.call_args[0][0]
             assert args[:2] == ["git", "clone"]
-            assert "ThatcherT/memory-file" in args[4]
+            assert "softwaresoftware-dev/memory-file" in args[4]
             assert result == [str(fake_marketplace / "cache" / "memory-file" / "0.1.0")]
 
     def test_clone_failure_skips(self, fake_marketplace):
