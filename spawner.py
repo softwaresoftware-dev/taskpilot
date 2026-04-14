@@ -545,17 +545,39 @@ TASK_ID="{task_id}"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 sleep 1
 
-# Register channel MCP in ~/.claude.json so Claude discovers it at startup
+# Register channel MCP + any project-scoped MCPs in ~/.claude.json
 python3 -c "
-import json; p = '$HOME/.claude.json'
-d = json.loads(open(p).read())
+import json, os
+from pathlib import Path
+
+p = Path.home() / '.claude.json'
+d = json.loads(p.read_text())
 d.setdefault('mcpServers', {{}})
+
+# Register taskpilot channel
 d['mcpServers']['{server_name}'] = {{
     'command': '{NODE_BIN}',
     'args': ['{channel_path}'],
     'env': {{'TASKPILOT_PORT': '{port}', 'TASKPILOT_NAME': '{server_name}'}}
 }}
-open(p, 'w').write(json.dumps(d, indent=2))
+
+# Register project-scoped MCPs from cwd/.claude/settings.json
+project_settings = Path('{project_dir}') / '.claude' / 'settings.json'
+_taskpilot_project_mcps = []
+if project_settings.exists():
+    try:
+        ps = json.loads(project_settings.read_text())
+        for name, cfg in ps.get('mcpServers', {{}}).items():
+            d['mcpServers'][name] = cfg
+            _taskpilot_project_mcps.append(name)
+    except Exception:
+        pass
+# Save list of project MCPs for cleanup
+(Path.home() / '.taskpilot' / '{task_id}' / 'project_mcps.json').write_text(
+    json.dumps(_taskpilot_project_mcps)
+)
+
+p.write_text(json.dumps(d, indent=2))
 "
 
 # Start Claude in tmux with crash-recovery while-loop
@@ -585,12 +607,25 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# Unregister channel MCP — the task session now owns the MCP process
+# Unregister channel MCP + project MCPs — the task session now owns them
 python3 -c "
-import json; p = '$HOME/.claude.json'
-d = json.loads(open(p).read())
-d.get('mcpServers', {{}}).pop('{server_name}', None)
-open(p, 'w').write(json.dumps(d, indent=2))
+import json
+from pathlib import Path
+
+p = Path.home() / '.claude.json'
+d = json.loads(p.read_text())
+mcps = d.get('mcpServers', {{}})
+# Remove taskpilot channel
+mcps.pop('{server_name}', None)
+# Remove project-scoped MCPs
+pmcps_file = Path.home() / '.taskpilot' / '{task_id}' / 'project_mcps.json'
+if pmcps_file.exists():
+    try:
+        for name in json.loads(pmcps_file.read_text()):
+            mcps.pop(name, None)
+    except Exception:
+        pass
+p.write_text(json.dumps(d, indent=2))
 "
 
 # Brief settle time
