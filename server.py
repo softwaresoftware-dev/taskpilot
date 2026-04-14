@@ -39,7 +39,7 @@ def create_task(
             schedule (str): Cron expression for recurring agents.
         model: Optional Claude model to use (e.g., "sonnet", "opus", "haiku").
         cwd: Optional working directory for the task (default: ~/.taskpilot/<task_id>/).
-        channels: Optional additional dev channel servers (e.g. ["server:session-proxy"]).
+        channels: Optional additional dev channel servers (e.g. ["server:session-bridge"]).
         kind: "task" for one-shot jobs, "service" for always-on agents that survive reboots.
 
     Returns:
