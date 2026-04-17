@@ -7,13 +7,26 @@
     "url": "https://github.com/ThatcherT"
   },
   "repository": "https://github.com/ThatcherT/taskpilot",
-  "license": "MIT",
-  "keywords": ["agent", "autonomous", "background", "task", "tmux", "channel", "scheduling", "cron"],
-  "built_in_capabilities": ["scheduling"],
+  "license": "Proprietary",
+  "keywords": [
+    "agent",
+    "autonomous",
+    "background",
+    "task",
+    "tmux",
+    "channel",
+    "scheduling",
+    "cron"
+  ],
+  "built_in_capabilities": [
+    "scheduling"
+  ],
   "mcpServers": {
     "taskpilot": {
       "command": "python",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/server.py"],
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server.py"
+      ],
       "cwd": "${CLAUDE_PLUGIN_ROOT}"
     }
   }

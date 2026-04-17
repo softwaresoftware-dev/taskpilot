@@ -1,21 +1,91 @@
-MIT License
+SOFTWARESOFTWARE PLUGIN LICENSE
 
-Copyright (c) 2026 Thatcher
+Copyright (c) 2026 NOV LLC. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This license governs the `taskpilot` plugin (the "Plugin") published by
+NOV LLC at `https://github.com/softwaresoftware-dev/taskpilot`, and all
+source code, documentation, configuration, skills, rules, hooks, and any
+other files distributed within the Plugin's repository (collectively, the
+"Software").
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+The Software is the proprietary property of NOV LLC, a Colorado
+limited-liability company, and its owner Thatcher Thornberry. All rights not
+expressly granted below are reserved.
+
+## 1. Permitted Use
+
+Subject to the restrictions in Section 2, you are permitted to:
+
+  a. Clone, download, or otherwise access this repository for personal,
+     non-commercial evaluation and use.
+
+  b. Install and run the Plugin inside Claude Code for your own personal use
+     (e.g. via `claude plugin install taskpilot@softwaresoftware-plugins`
+     or `/softwaresoftware:install taskpilot`).
+
+  c. Read the source for the purpose of understanding how the Plugin
+     interacts with your environment.
+
+## 2. Prohibited Use
+
+Except with prior written permission from NOV LLC, you may NOT:
+
+  a. Modify, adapt, translate, or create derivative works from the Software.
+
+  b. Redistribute, republish, mirror, sublicense, sell, rent, lease, or
+     otherwise transfer the Software, in whole or in part, to any third party.
+
+  c. Fork or reproduce this repository for the purpose of publishing a
+     competing plugin, product, or service based on the Software.
+
+  d. Use the Software for any commercial purpose, including but not limited
+     to: incorporating it into a product or service for which any fee is
+     charged; using it to generate revenue, directly or indirectly; or
+     integrating it into business operations intended to produce profit.
+
+  e. Remove, obscure, or alter any copyright notice, trademark, attribution,
+     or other proprietary marking.
+
+  f. Use the name "softwaresoftware", "NOV LLC", "taskpilot", or any
+     associated mark, to endorse, promote, or imply association with
+     derivative or third-party works.
+
+## 3. Commercial Licensing
+
+Any commercial use of the Software requires a separate paid license agreement
+with NOV LLC. To negotiate commercial terms, contact the owner in writing.
+
+## 4. Third-Party Components
+
+The Plugin may depend on, reference, or invoke software or services owned by
+independent third parties. Those components remain licensed by their
+respective owners under their own terms. Nothing in this license grants
+rights to, or imposes restrictions on, such third-party works.
+
+## 5. No Warranty
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL NOV
+LLC OR ITS OWNER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF,
+OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+## 6. Termination
+
+Any use of the Software in violation of this license automatically and
+immediately terminates the rights granted in Section 1. Upon termination, you
+must cease all use of the Software and destroy any copies in your possession.
+
+## 7. Governing Law
+
+This license is governed by the laws of the State of Colorado, United States,
+without regard to its conflict-of-laws principles. Any dispute arising under
+this license shall be resolved in the state or federal courts located in
+Colorado.
+
+---
+
+Copyright (c) 2026 NOV LLC. All rights reserved.
+The authoritative template for this license is maintained at
+`nov-llc/licenses/softwaresoftware-plugin-license-template.md`.
