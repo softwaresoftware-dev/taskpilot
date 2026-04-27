@@ -113,7 +113,7 @@ def spawn_task(task_id: str) -> dict:
 
     if kind == "service":
         # Generate startup script and install systemd service
-        spawner.write_service_script(task_id, plugins, model=model, cwd=cwd, channels=channels)
+        spawner.write_service_script(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
         spawner.install_service(task_id)
 
         # Poll session-bridge for the task to become reachable
@@ -138,7 +138,7 @@ def spawn_task(task_id: str) -> dict:
         }
     else:
         # Standard task — launch directly in tmux
-        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels)
+        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
         if not success:
             conn.close()
             return {"error": "Failed to launch tmux session"}

@@ -82,7 +82,7 @@ def main():
             return
 
         # Spawn tmux session (~16s for startup dialogs)
-        success = spawner.spawn_tmux(task_id, plugins, cwd=cwd, channels=channels)
+        success = spawner.spawn_tmux(task_id, plugins, cwd=cwd, channels=channels, kind="task")
         if not success:
             print(json.dumps({"ok": False, "error": "Failed to launch tmux session"}))
             sys.exit(1)

@@ -23,10 +23,29 @@ Spawn and manage long-running autonomous Claude Code sessions. Each task runs in
    - **`kind=task`** (default): launches directly in tmux.
    - **`kind=service`**: generates `start.sh` + systemd user service, survives reboots.
 3. Claude is launched with `--name <task_id>`. session-bridge's `channel.mjs` parses that flag from `/proc/<ppid>/cmdline` at MCP boot and registers the session under that name — no agent-side `set_name` call required.
-4. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
-5. External callers (taskboard "msg" button, cron schedules) send messages the same way.
-6. On crash, the while-loop in tmux respawns via `rotation.py`.
-7. Task completes when the agent writes `"phase": "done"` to state.json.
+4. Claude is also launched with `--settings <task_dir>/hook-settings.json` so per-task `Stop` and `Notification` hooks fire (see "Lifecycle Hooks" below).
+5. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
+6. External callers (taskboard "msg" button, cron schedules) send messages the same way.
+7. On crash or exit, the while-loop in tmux respawns via `rotation.py`.
+8. Task completes when either the agent writes `"phase": "done"` to state.json, or its final assistant message matches the completion regex in `rotation.py`.
+
+## Lifecycle Hooks
+
+Spawned agents run with two Claude Code hooks registered via `--settings`:
+
+- **`Stop`** → `hooks/on-stop.py` — fires when the assistant finishes a turn. Records `last_assistant_message`, timestamp, and session id to `state/agent.json`.
+- **`Notification`** → `hooks/on-notification.py` — fires when Claude has been idle at a prompt past ~6s. Records `notification_type` (`permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog`) plus message and title.
+
+Both hooks share `hooks/_record.py` for the read-modify-write of `agent.json` and the `events.jsonl` audit log. They no-op when `TASKPILOT_TASK_ID` is unset, which keeps them safe if the settings file is loaded outside a taskpilot context.
+
+`rotation.py` consults `state/agent.json` after each Claude exit:
+
+1. DB status not `running` → never respawn.
+2. `state.json` has `phase` in `done|completed` → mark completed.
+3. `state/agent.json#last_stop.last_assistant_message` matches `COMPLETION_PATTERNS` → mark completed.
+4. Default → respawn.
+
+The `Notification` record is written but not yet acted on — that's the next layer (auto-yes for permission prompts in the agent's existing tool scope; escalate elicitation dialogs to a human via the notification capability).
 
 ## Service Persistence
 
