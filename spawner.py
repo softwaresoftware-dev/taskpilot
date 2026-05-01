@@ -318,6 +318,12 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     for ch in (channels or []):
         if ch not in all_channels:
             all_channels.append(ch)
+
+    # Verify each channel reference resolves before launching. Skipping this
+    # check produces a deaf agent (channel.mjs never loads → no bridge
+    # registration → silent failure 20s later).
+    validate_channels(all_channels)
+
     channels_arg = " ".join(all_channels)
 
     labels = _session_labels(kind)
@@ -357,13 +363,12 @@ done"""
     time.sleep(4)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
 
-    # Wait for session-bridge to see the session with a channel port.
-    # session-bridge channel.mjs parses --name from claude's cmdline and
-    # registers us under task_id, so we can poll by name.
-    for _ in range(20):
-        if channel_healthy(task_id):
-            break
-        time.sleep(1)
+    # Wait for session-bridge to register the session by name. If the channel
+    # never comes up (validate_channels passed but something else went wrong —
+    # bridge daemon down, claude crashed during boot, etc.), report failure
+    # rather than silently returning success.
+    if not wait_for_channel(task_id, timeout=20):
+        return False
 
     # Brief settle time for MCP connection
     time.sleep(3)
@@ -423,6 +428,70 @@ def channel_healthy(task_id: str) -> bool:
         return False
 
 
+def wait_for_channel(task_id: str, timeout: int = 20) -> bool:
+    """Poll until the task's channel registers with session-bridge, or timeout.
+
+    Returns True if the channel was healthy within the timeout, False otherwise.
+    Caller is responsible for surfacing failure to its own caller — this just
+    reports the truth instead of optimistically returning True like the old
+    inline polling did.
+    """
+    for _ in range(timeout):
+        if channel_healthy(task_id):
+            return True
+        time.sleep(1)
+    return False
+
+
+class ChannelResolutionError(RuntimeError):
+    """Raised when a --channels reference can't be resolved to a loadable MCP/plugin.
+
+    A spawn that proceeds with an unresolvable channel produces a "deaf" agent:
+    Claude warns "no MCP server configured with that name" and the channel.mjs
+    that would register the session with the bridge never starts. The agent is
+    alive in tmux but unreachable from the mesh. Validating up front turns that
+    silent failure into an explicit error at spawn time.
+    """
+
+
+def validate_channels(channels: list[str]) -> None:
+    """Raise ChannelResolutionError if any channel reference doesn't resolve.
+
+    Channel forms:
+      server:<name>          — must be a configured MCP in ~/.claude.json
+      plugin:<name>@<market> — must be installed per installed_plugins.json
+
+    Anything else passes (forward-compat with future channel kinds).
+    """
+    if not channels:
+        return
+
+    claude_json = _read_json(CLAUDE_JSON) or {}
+    user_mcps = set((claude_json.get("mcpServers") or {}).keys())
+
+    installed = _read_json(INSTALLED_PLUGINS_PATH) or {}
+    installed_plugins = {key.split("@")[0] for key in installed.get("plugins", {}).keys()}
+
+    for ch in channels:
+        if ch.startswith("server:"):
+            name = ch[len("server:"):]
+            if name not in user_mcps:
+                raise ChannelResolutionError(
+                    f"channel '{ch}' references MCP server '{name}' which is not "
+                    f"configured. Add it via `claude mcp add {name} ...` or remove "
+                    f"this channel from the spawn config."
+                )
+        elif ch.startswith("plugin:"):
+            spec = ch[len("plugin:"):]
+            name = spec.split("@", 1)[0]
+            if name not in installed_plugins:
+                raise ChannelResolutionError(
+                    f"channel '{ch}' references plugin '{name}' which is not "
+                    f"installed. Install via `/softwaresoftware:install {name}` "
+                    f"(or `claude plugin install {spec}`) or remove this channel."
+                )
+
+
 # ---------------------------------------------------------------------------
 # systemd service lifecycle for kind=service
 # ---------------------------------------------------------------------------
@@ -479,11 +548,17 @@ def write_service_script(
     model_flag = f" --model {model}" if model else ""
 
     # Build dev channels — session-bridge loaded via marketplace plugin form.
-    # See spawn_task() for the why behind plugin: vs server: choice.
+    # See spawn_tmux() for the why behind plugin: vs server: choice.
     all_channels = ["plugin:session-bridge@softwaresoftware-plugins"]
     for ch in (channels or []):
         if ch not in all_channels:
             all_channels.append(ch)
+
+    # Validate before writing the script — generating a start.sh that
+    # systemd will faithfully respawn forever with broken channel refs is
+    # worse than failing here.
+    validate_channels(all_channels)
+
     channels_arg = " ".join(all_channels)
 
     labels = _session_labels(kind)

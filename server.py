@@ -141,17 +141,24 @@ def spawn_task(task_id: str) -> dict:
         }
 
     if kind == "service":
-        # Generate startup script and install systemd service
-        spawner.write_service_script(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
+        # Generate startup script and install systemd service.
+        # write_service_script validates channel refs upfront — surfaces a
+        # clear error here instead of letting systemd respawn a broken
+        # start.sh forever.
+        try:
+            spawner.write_service_script(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
+        except spawner.ChannelResolutionError as e:
+            conn.close()
+            return {"error": f"channel validation failed: {e}"}
+
         spawner.install_service(task_id)
 
-        # Poll session-bridge for the task to become reachable
-        for _ in range(40):
-            if spawner.channel_healthy(task_id):
-                break
-            time.sleep(1)
+        # Wait for systemd-launched start.sh to bring the channel up.
+        channel_ready = spawner.wait_for_channel(task_id, timeout=40)
 
-        # Update status
+        # Update status — the service is "running" from systemd's perspective
+        # even if the channel didn't register yet. The channel_ready bit in
+        # the response tells the caller whether it's actually reachable.
         store.update_status(conn, task_id, "running")
         store.increment_invocation(conn, task_id)
         conn.close()
@@ -163,14 +170,19 @@ def spawn_task(task_id: str) -> dict:
             "tmux_session": spawner.tmux_session_name(task_id),
             "systemd_service": spawner._systemd_unit_name(task_id),
             "systemd_active": spawner.is_service_active(task_id),
-            "channel_healthy": spawner.channel_healthy(task_id),
+            "channel_healthy": channel_ready,
         }
     else:
-        # Standard task — launch directly in tmux
-        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
+        # Standard task — launch directly in tmux.
+        try:
+            success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
+        except spawner.ChannelResolutionError as e:
+            conn.close()
+            return {"error": f"channel validation failed: {e}"}
+
         if not success:
             conn.close()
-            return {"error": "Failed to launch tmux session"}
+            return {"error": "spawn failed: tmux launched but channel never registered with session-bridge within 20s"}
 
         # Update status
         store.update_status(conn, task_id, "running")
@@ -185,7 +197,8 @@ def spawn_task(task_id: str) -> dict:
             "task_id": task_id,
             "kind": "task",
             "tmux_session": spawner.tmux_session_name(task_id),
-            "channel_healthy": spawner.channel_healthy(task_id),
+            # spawn_tmux confirmed channel before returning success.
+            "channel_healthy": True,
         }
 
 

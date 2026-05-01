@@ -1,6 +1,6 @@
 [project]
 name = "taskpilot"
-version = "0.5.0"
+version = "0.5.1"
 description = "Spawn and manage long-running autonomous Claude Code sessions"
 requires-python = ">=3.11"
 dependencies = [
