@@ -1,7 +1,7 @@
 {
   "name": "taskpilot",
   "description": "Spawn and manage long-running autonomous Claude Code sessions for background tasks",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "author": {
     "name": "NOV LLC",
     "url": "https://github.com/softwaresoftware-dev"
