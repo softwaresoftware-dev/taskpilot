@@ -80,6 +80,20 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN host TEXT DEFAULT NULL")
         conn.commit()
 
+    # Migrate: last_seen_at — most recent liveness signal (heartbeat or hook fire).
+    try:
+        conn.execute("SELECT last_seen_at FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_seen_at TEXT DEFAULT NULL")
+        conn.commit()
+
+    # Migrate: last_error — short string describing the most recent failure.
+    try:
+        conn.execute("SELECT last_error FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_error TEXT DEFAULT NULL")
+        conn.commit()
+
 
 def allocate_port(conn: sqlite3.Connection) -> int:
     """Find the next available port starting from PORT_RANGE_START."""
@@ -149,6 +163,27 @@ def increment_invocation(conn: sqlite3.Connection, task_id: str) -> None:
     conn.execute(
         "UPDATE tasks SET invocation_count = invocation_count + 1, updated_at = datetime('now') WHERE task_id = ?",
         (task_id,),
+    )
+    conn.commit()
+
+
+def mark_seen(conn: sqlite3.Connection, task_id: str) -> None:
+    """Stamp last_seen_at = now. Called whenever the agent emits a hook or the
+    liveness reconciler confirms the tmux session is alive."""
+    conn.execute(
+        "UPDATE tasks SET last_seen_at = datetime('now') WHERE task_id = ?",
+        (task_id,),
+    )
+    conn.commit()
+
+
+def mark_crashed(conn: sqlite3.Connection, task_id: str, error: str) -> None:
+    """Flip status to 'crashed' and record why. Called when the liveness
+    reconciler finds a row marked 'running' but no live tmux session."""
+    conn.execute(
+        """UPDATE tasks SET status = 'crashed', last_error = ?, updated_at = datetime('now')
+           WHERE task_id = ?""",
+        (error, task_id),
     )
     conn.commit()
 

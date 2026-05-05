@@ -1,9 +1,17 @@
-"""MCP server for taskpilot — task lifecycle, messaging, and scheduling."""
+"""MCP server for taskpilot — task lifecycle, messaging, and scheduling.
+
+The MCP server is a thin client over the taskpilot supervisor daemon for
+spawn/kill/message. Falls back to direct (in-process) calls if the daemon
+isn't running, so tests and pre-daemon installs keep working. Phase 3
+cleanup will remove the fallback once the daemon is mandatory.
+"""
 
 import json
 import os
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +24,34 @@ mcp = FastMCP("taskpilot")
 
 TASKPILOT_DIR = Path.home() / ".taskpilot"
 SCHEDULES_FILE = TASKPILOT_DIR / "schedules.json"
+DAEMON_URL = os.environ.get("TASKPILOT_DAEMON_URL", "http://127.0.0.1:8912")
+
+
+def _daemon_call(method: str, path: str, json_body: dict | None = None) -> dict | None:
+    """Call the taskpilot supervisor daemon over HTTP.
+
+    Returns:
+      dict with the daemon's JSON response on 2xx.
+      dict {"error": "..."} on non-2xx (caller surfaces to user).
+      None if the daemon is unreachable (caller falls back to direct call).
+    """
+    url = f"{DAEMON_URL}{path}"
+    data = json.dumps(json_body).encode() if json_body else None
+    headers = {"Accept": "application/json"}
+    if data:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+            return {"error": body.get("detail", str(e))}
+        except Exception:
+            return {"error": f"daemon returned {e.code}"}
+    except urllib.error.URLError:
+        return None  # daemon down — caller falls back
 
 
 @mcp.tool()
@@ -173,7 +209,16 @@ def spawn_task(task_id: str) -> dict:
             "channel_healthy": channel_ready,
         }
     else:
-        # Standard task — launch directly in tmux.
+        # Standard task — try the supervisor daemon first (it owns spawn
+        # going forward). If the daemon isn't running, fall back to the
+        # in-process path so this MCP keeps working pre-daemon and in tests.
+        conn.close()
+        daemon_result = _daemon_call("POST", f"/tasks/{task_id}/spawn")
+        if daemon_result is not None:
+            return daemon_result
+
+        # Daemon down — direct path.
+        conn = store.get_db()
         try:
             success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
         except spawner.ChannelResolutionError as e:
@@ -270,6 +315,14 @@ def send_message(task_id: str, message: str) -> dict:
     Returns:
         Delivery status.
     """
+    # Route through daemon when available; fall back to direct otherwise.
+    daemon_result = _daemon_call(
+        "POST", f"/tasks/{task_id}/message",
+        json_body={"text": message, "from_session": "taskpilot-mcp"},
+    )
+    if daemon_result is not None:
+        return daemon_result
+
     conn = store.get_db()
     task = store.get_task(conn, task_id)
     conn.close()
@@ -312,6 +365,16 @@ def kill_task(task_id: str) -> dict:
         return {"error": f"Task '{task_id}' not found"}
 
     kind = task.get("kind", "task")
+
+    # For kind=task, try daemon first (it owns the lifecycle going forward).
+    # kind=service still uses systemd until phase 2.
+    if kind == "task":
+        conn.close()
+        daemon_result = _daemon_call("POST", f"/tasks/{task_id}/kill")
+        if daemon_result is not None:
+            return daemon_result
+        conn = store.get_db()  # daemon down — fall through to direct path
+
     service_removed = False
 
     # For services, stop and disable the systemd unit

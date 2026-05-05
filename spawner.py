@@ -1,9 +1,9 @@
 """Spawner — writes config files, launches tmux session.
 
 Messaging goes through session-bridge (localhost:8910). Agents are
-addressable by task_id because claude is launched with --name <task_id>,
-which session-bridge's channel.mjs parses from /proc/<ppid>/cmdline at
-registration time.
+addressable by task_id because we export SESSION_NAME=<task_id>; the
+session-bridge channel.mjs reads that env var and includes it in its
+/register payload, which is how the daemon names the session.
 """
 
 import json
@@ -267,7 +267,8 @@ def _session_labels(kind: str) -> str:
 
 
 def write_hook_settings(task_id: str) -> Path:
-    """Write a per-task settings file that registers Stop and Notification hooks.
+    """Write a per-task settings file that registers Stop, Notification, and
+    UserPromptSubmit hooks.
 
     Loaded by claude via `--settings <path>`. The flagSettings source merges
     with user/project settings rather than replacing them, so we add hooks
@@ -278,11 +279,13 @@ def write_hook_settings(task_id: str) -> Path:
 
     on_stop = HOOKS_DIR / "on-stop.py"
     on_notification = HOOKS_DIR / "on-notification.py"
+    on_prompt = HOOKS_DIR / "on-prompt.py"
 
     settings = {
         "hooks": {
             "Stop": [{"hooks": [{"type": "command", "command": str(on_stop)}]}],
             "Notification": [{"hooks": [{"type": "command", "command": str(on_notification)}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": str(on_prompt)}]}],
         }
     }
 
@@ -331,9 +334,11 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     # The tmux command: while-loop for crash recovery
     # rotation.py handles respawn decisions
     # Export TASKPILOT_TASK_ID so capability plugins can scope their storage
-    # Export SESSION_NAMESPACE/SESSION_LABELS so session-bridge channel.mjs
-    # registers this agent under namespace=taskpilot at /register time.
+    # Export SESSION_NAME/SESSION_NAMESPACE/SESSION_LABELS so session-bridge
+    # channel.mjs registers this agent under name=<task_id>, namespace=taskpilot
+    # at /register time.
     cmd = f"""export TASKPILOT_TASK_ID={task_id}
+export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export SESSION_LABELS={labels}
 while true; do
@@ -526,8 +531,8 @@ def write_service_script(
     """Generate start.sh for a kind=service agent.
 
     Messaging routes through session-bridge (localhost:8910). Agent is
-    addressable by task_id because claude is launched with --name <task_id>
-    and session-bridge auto-names from that at /register time.
+    addressable by task_id because we export SESSION_NAME=<task_id>; the
+    session-bridge channel.mjs reads that env var at /register time.
     """
     td = task_dir(task_id)
     td.mkdir(parents=True, exist_ok=True)
@@ -625,10 +630,11 @@ p.write_text(json.dumps(d, indent=2))
 "
 
 # Start Claude in tmux with crash-recovery while-loop
-# SESSION_NAMESPACE/SESSION_LABELS are read by session-bridge channel.mjs
-# so this agent registers under namespace=taskpilot.
+# SESSION_NAME/SESSION_NAMESPACE/SESSION_LABELS are read by session-bridge
+# channel.mjs at /register time, naming this agent and putting it in the
+# taskpilot namespace.
 tmux new-session -d -s "$SESSION" -c "$PROJECT_DIR" \\
-    "bash -lc 'export TASKPILOT_TASK_ID={task_id}; export SESSION_NAMESPACE={SESSION_NAMESPACE}; export SESSION_LABELS={labels}; while true; do cd {project_dir} && \\
+    "bash -lc 'export TASKPILOT_TASK_ID={task_id}; export SESSION_NAME={task_id}; export SESSION_NAMESPACE={SESSION_NAMESPACE}; export SESSION_LABELS={labels}; while true; do cd {project_dir} && \\
     {CLAUDE_BIN} --dangerously-skip-permissions \\
     --dangerously-load-development-channels {channels_arg} \\
     --settings {hook_settings} \\
@@ -647,8 +653,8 @@ sleep 4
 tmux send-keys -t "$SESSION" Enter
 
 # Wait for session-bridge to see the task by name with a live channel port.
-# session-bridge's channel.mjs parses --name from claude's /proc/<ppid>/cmdline
-# and registers us under $TASK_ID automatically.
+# Naming comes from the SESSION_NAME env var exported above, which
+# channel.mjs reads and includes in its /register payload.
 for i in $(seq 1 30); do
     if curl -sf -m 2 "$SESSION_BRIDGE_URL/sessions/$TASK_ID" \\
          | python3 -c "import sys, json; d = json.load(sys.stdin); sys.exit(0 if d.get('channel_port') else 1)" \\

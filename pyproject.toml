@@ -1,10 +1,12 @@
 [project]
 name = "taskpilot"
-version = "0.5.1"
+version = "0.6.0"
 description = "Spawn and manage long-running autonomous Claude Code sessions"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [project.optional-dependencies]

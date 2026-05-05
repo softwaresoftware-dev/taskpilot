@@ -19,7 +19,7 @@ PLUGIN_ROOT = HOOKS_DIR.parent
 sys.path.insert(0, str(HOOKS_DIR))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-from _record import now_iso, read_event, task_id, write_record
+from _record import mark_seen, now_iso, read_event, task_id, write_record
 import actions
 import classifier
 
@@ -42,6 +42,7 @@ def main() -> int:
         "session_id": event.get("session_id"),
     }
     write_record(tid, "last_stop", record)
+    mark_seen(tid)
 
     bucket = classifier.classify(message)
     if bucket == "resolved":

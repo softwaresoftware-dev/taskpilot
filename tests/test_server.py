@@ -227,3 +227,93 @@ class TestSpawnTaskHostDispatch:
             mock_remote.assert_not_called()
             mock_local.assert_called_once()
             assert result["status"] == "running"
+
+
+class TestDaemonDispatch:
+    """spawn/kill/message route through the supervisor daemon when it's up."""
+
+    def test_spawn_uses_daemon_when_reachable(self, db_path, tmp_path):
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+            server.create_task(name="d task", description="hi")
+
+            daemon_response = {
+                "status": "running",
+                "task_id": "d-task",
+                "kind": "task",
+                "tmux_session": "d-task",
+                "channel_healthy": True,
+            }
+            with (
+                patch("server._daemon_call", return_value=daemon_response) as mock_dc,
+                patch.object(spawner, "spawn_tmux") as mock_local,
+            ):
+                result = server.spawn_task("d-task")
+
+            mock_dc.assert_called_once_with("POST", "/tasks/d-task/spawn")
+            mock_local.assert_not_called()  # daemon won — no fallback
+            assert result == daemon_response
+
+    def test_spawn_falls_back_to_direct_when_daemon_down(self, db_path, tmp_path):
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+            server.create_task(name="d task", description="hi")
+
+            with (
+                patch("server._daemon_call", return_value=None) as mock_dc,
+                patch.object(spawner, "spawn_tmux", return_value=True) as mock_local,
+                patch.object(spawner, "send_initial_prompt"),
+                patch.object(spawner, "tmux_session_name", return_value="d-task"),
+            ):
+                result = server.spawn_task("d-task")
+
+            mock_dc.assert_called_once()
+            mock_local.assert_called_once()  # fell back
+            assert result["status"] == "running"
+
+    def test_kill_uses_daemon_when_reachable(self, db_path, tmp_path):
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+            server.create_task(name="d task", description="hi")
+
+            daemon_response = {"task_id": "d-task", "status": "killed", "tmux_killed": True}
+            with (
+                patch("server._daemon_call", return_value=daemon_response) as mock_dc,
+                patch.object(spawner, "kill_tmux") as mock_local,
+            ):
+                result = server.kill_task("d-task")
+
+            mock_dc.assert_called_once_with("POST", "/tasks/d-task/kill")
+            mock_local.assert_not_called()
+            assert result == daemon_response
+
+    def test_message_uses_daemon_when_reachable(self, db_path, tmp_path):
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+            server.create_task(name="d task", description="hi")
+
+            daemon_response = {"delivered": True, "response": "ok (chat_id: 3)"}
+            with patch("server._daemon_call", return_value=daemon_response) as mock_dc:
+                result = server.send_message("d-task", "hello")
+
+            mock_dc.assert_called_once_with(
+                "POST", "/tasks/d-task/message",
+                json_body={"text": "hello", "from_session": "taskpilot-mcp"},
+            )
+            assert result == daemon_response

@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--brief", help="Path to JSON file with operating brief", default="")
     parser.add_argument("--cwd", help="Working directory for the task", default="")
     parser.add_argument("--channels", help="Comma-separated additional dev channel servers", default="")
+    parser.add_argument("--model", help="Override model (e.g. haiku, sonnet, opus)", default="")
     parser.add_argument("--dry-run", action="store_true", help="Create task without spawning")
     args = parser.parse_args()
 
@@ -82,7 +83,10 @@ def main():
             return
 
         # Spawn tmux session (~16s for startup dialogs)
-        success = spawner.spawn_tmux(task_id, plugins, cwd=cwd, channels=channels, kind="task")
+        success = spawner.spawn_tmux(
+            task_id, plugins, model=args.model or None,
+            cwd=cwd, channels=channels, kind="task",
+        )
         if not success:
             print(json.dumps({"ok": False, "error": "Failed to launch tmux session"}))
             sys.exit(1)

@@ -56,3 +56,19 @@ def write_record(tid: str, key: str, record: dict) -> None:
 
     with (sd / "events.jsonl").open("a") as f:
         f.write(json.dumps({"key": key, **record}) + "\n")
+
+
+def mark_seen(tid: str) -> None:
+    """Touch tasks.last_seen_at = now. Best-effort: any failure (DB locked,
+    schema mismatch, sqlite missing) is swallowed so a hook never blocks the
+    agent. The liveness reconciler is the source of truth — this just keeps
+    the column warm between reconciler runs."""
+    try:
+        import store as _store  # taskpilot/store.py — sys.path is set by callers
+        conn = _store.get_db()
+        try:
+            _store.mark_seen(conn, tid)
+        finally:
+            conn.close()
+    except Exception:
+        return

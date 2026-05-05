@@ -151,3 +151,49 @@ class TestStatusAndInvocation:
         assert store.get_task(db, "i1")["invocation_count"] == 1
         store.increment_invocation(db, "i1")
         assert store.get_task(db, "i1")["invocation_count"] == 2
+
+
+class TestLiveness:
+    def test_last_seen_and_last_error_columns_exist(self, db):
+        columns = [row[1] for row in db.execute("PRAGMA table_info(tasks)")]
+        assert "last_seen_at" in columns
+        assert "last_error" in columns
+
+    def test_mark_seen_sets_timestamp(self, db):
+        store.create_task(db, "ls1", "LS1", "desc")
+        assert store.get_task(db, "ls1")["last_seen_at"] is None
+        store.mark_seen(db, "ls1")
+        assert store.get_task(db, "ls1")["last_seen_at"] is not None
+
+    def test_mark_crashed_flips_status_and_records_error(self, db):
+        store.create_task(db, "cr1", "CR1", "desc")
+        store.update_status(db, "cr1", "running")
+        store.mark_crashed(db, "cr1", "tmux session not found")
+        task = store.get_task(db, "cr1")
+        assert task["status"] == "crashed"
+        assert task["last_error"] == "tmux session not found"
+
+    def test_migration_adds_liveness_columns_to_old_schema(self, tmp_path):
+        db_path = str(tmp_path / "old.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE tasks (
+                task_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                port INTEGER UNIQUE,
+                plugins TEXT DEFAULT '[]',
+                invocation_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        conn = store.get_db(db_path)
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(tasks)")]
+        assert "last_seen_at" in columns
+        assert "last_error" in columns
+        conn.close()

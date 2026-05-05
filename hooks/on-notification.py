@@ -16,8 +16,12 @@ fires). The elicitation cases are the practically interesting signals.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-from _record import now_iso, read_event, task_id, write_record
+HOOKS_DIR = Path(__file__).parent
+PLUGIN_ROOT = HOOKS_DIR.parent
+
+sys.path.insert(0, str(HOOKS_DIR))
+sys.path.insert(0, str(PLUGIN_ROOT))
+from _record import mark_seen, now_iso, read_event, task_id, write_record
 
 
 def main() -> int:
@@ -37,6 +41,7 @@ def main() -> int:
         "session_id": event.get("session_id"),
     }
     write_record(tid, "last_notification", record)
+    mark_seen(tid)
     return 0
 
 

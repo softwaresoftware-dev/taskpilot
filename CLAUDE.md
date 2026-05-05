@@ -22,7 +22,7 @@ Spawn and manage long-running autonomous Claude Code sessions. Each task runs in
 2. `spawn_task()` launches the agent:
    - **`kind=task`** (default): launches directly in tmux.
    - **`kind=service`**: generates `start.sh` + systemd user service, survives reboots.
-3. Claude is launched with `--name <task_id>`. session-bridge's `channel.mjs` parses that flag from `/proc/<ppid>/cmdline` at MCP boot and registers the session under that name — no agent-side `set_name` call required.
+3. Claude is launched with `--name <task_id>` and `SESSION_NAME=<task_id>` exported into its env. session-bridge's `channel.mjs` reads `SESSION_NAME` (along with `SESSION_NAMESPACE` and `SESSION_LABELS`) and includes them in its `/register` payload, so the daemon names the session under the task id — no agent-side `set_name` call required.
 4. Claude is also launched with `--settings <task_dir>/hook-settings.json` so per-task `Stop` and `Notification` hooks fire (see "Lifecycle Hooks" below).
 5. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
 6. External callers (taskboard "msg" button, cron schedules) send messages the same way.
@@ -31,12 +31,13 @@ Spawn and manage long-running autonomous Claude Code sessions. Each task runs in
 
 ## Lifecycle Hooks
 
-Spawned agents run with two Claude Code hooks registered via `--settings`:
+Spawned agents run with three Claude Code hooks registered via `--settings`:
 
 - **`Stop`** → `hooks/on-stop.py` — fires when the assistant finishes a turn. Records `last_assistant_message`, timestamp, and session id to `state/agent.json`, then classifies and acts.
 - **`Notification`** → `hooks/on-notification.py` — fires when Claude has been idle at a prompt past ~6s. Records `notification_type` (`permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog`) plus message and title.
+- **`UserPromptSubmit`** → `hooks/on-prompt.py` — fires when an inbound prompt arrives (mesh message or user input). Records the prompt (truncated) so received-vs-replied can be paired against the matching Stop event. This is what makes "library got a query but never replied" visible.
 
-Both hooks share `hooks/_record.py` for the read-modify-write of `agent.json` and the `events.jsonl` audit log. They no-op when `TASKPILOT_TASK_ID` is unset, which keeps them safe if the settings file is loaded outside a taskpilot context.
+All three share `hooks/_record.py` for the read-modify-write of `agent.json` and the `events.jsonl` audit log. They no-op when `TASKPILOT_TASK_ID` is unset, which keeps them safe if the settings file is loaded outside a taskpilot context. Each hook also calls `mark_seen()` to stamp `tasks.last_seen_at = now`, so the liveness reconciler (below) can distinguish recently-active tasks from genuinely silent ones.
 
 ### Stop hook classify + act
 
@@ -60,6 +61,30 @@ The Stop hook handles the common path. `rotation.py` only runs after Claude actu
 4. Default → respawn.
 
 The `Notification` record is written but not yet acted on. Next layer: auto-yes for permission prompts within the agent's tool scope; escalate elicitation dialogs through `notify_human`.
+
+## Liveness Reconciler
+
+`liveness.py` walks every task with `status='running'`, checks `is_tmux_alive`, and reconciles the DB with reality:
+
+- alive → stamp `last_seen_at = now`
+- dead → flip status to `crashed`, set `last_error`, append a `liveness_crash` record to `~/.taskpilot/<id>/state/events.jsonl`
+
+Without this, `status='running'` lied indefinitely whenever an agent died silently (OOM, host reboot, tmux server crash) — the row only ever flipped via the Stop-hook completion path. New columns: `last_seen_at`, `last_error`.
+
+Install the systemd user timer (60s interval):
+
+```bash
+python3 ~/projects/softwaresoftware/projects/plugins/providers/taskpilot/liveness.py --install
+```
+
+Run a one-shot reconcile any time:
+
+```bash
+python3 .../liveness.py            # human-readable summary
+python3 .../liveness.py --json     # JSON for piping into a dashboard
+```
+
+Existing services (librarian, dispatcher) keep their old two-hook config until restarted. To pick up the new `UserPromptSubmit` hook, re-spawn them or rewrite their `hook-settings.json` and `systemctl --user restart taskpilot-<id>`.
 
 ## Service Persistence
 
