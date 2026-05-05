@@ -205,11 +205,13 @@ class TestSpawnTaskHostDispatch:
             assert "pixel-7-pro" in result["error"]
 
     def test_spawn_self_host_falls_through_to_local(self, db_path, tmp_path):
-        """host=local-yocal where local-yocal is self → existing local tmux path."""
+        """host=local-yocal where local-yocal is self → daemon dispatch.
+        With no daemon reachable (patched), falls through to local tmux."""
         with (
             patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
             patch.object(spawner, "TASKPILOT_DIR", tmp_path),
             patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+            patch("server._daemon_call", return_value=None),  # daemon unreachable in test
         ):
             (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
             server.create_task(name="local task", description="hi", host="local-yocal")

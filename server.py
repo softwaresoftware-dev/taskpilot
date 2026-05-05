@@ -175,75 +175,43 @@ def spawn_task(task_id: str) -> dict:
             "channel_healthy": True,  # peer confirmed registration before returning
         }
 
-    if kind == "service":
-        # Generate startup script and install systemd service.
-        # write_service_script validates channel refs upfront — surfaces a
-        # clear error here instead of letting systemd respawn a broken
-        # start.sh forever.
-        try:
-            spawner.write_service_script(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
-        except spawner.ChannelResolutionError as e:
-            conn.close()
-            return {"error": f"channel validation failed: {e}"}
+    # Both kind=task and kind=service route through the supervisor daemon.
+    # The daemon's reconciler is what gives services their "auto-respawn after
+    # crash" behavior — no per-task systemd unit needed. If the daemon isn't
+    # running, fall back to the in-process path so the MCP keeps working in
+    # pre-daemon environments and in tests.
+    conn.close()
+    daemon_result = _daemon_call("POST", f"/tasks/{task_id}/spawn")
+    if daemon_result is not None:
+        return daemon_result
 
-        spawner.install_service(task_id)
-
-        # Wait for systemd-launched start.sh to bring the channel up.
-        channel_ready = spawner.wait_for_channel(task_id, timeout=40)
-
-        # Update status — the service is "running" from systemd's perspective
-        # even if the channel didn't register yet. The channel_ready bit in
-        # the response tells the caller whether it's actually reachable.
-        store.update_status(conn, task_id, "running")
-        store.increment_invocation(conn, task_id)
+    # Daemon down — direct path. spawn_tmux works for both kinds; the kind=service
+    # auto-respawn behavior won't kick in without the daemon, but that's the same
+    # tradeoff every fallback makes.
+    conn = store.get_db()
+    try:
+        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
+    except spawner.ChannelResolutionError as e:
         conn.close()
+        return {"error": f"channel validation failed: {e}"}
 
-        return {
-            "status": "running",
-            "task_id": task_id,
-            "kind": "service",
-            "tmux_session": spawner.tmux_session_name(task_id),
-            "systemd_service": spawner._systemd_unit_name(task_id),
-            "systemd_active": spawner.is_service_active(task_id),
-            "channel_healthy": channel_ready,
-        }
-    else:
-        # Standard task — try the supervisor daemon first (it owns spawn
-        # going forward). If the daemon isn't running, fall back to the
-        # in-process path so this MCP keeps working pre-daemon and in tests.
+    if not success:
         conn.close()
-        daemon_result = _daemon_call("POST", f"/tasks/{task_id}/spawn")
-        if daemon_result is not None:
-            return daemon_result
+        return {"error": "spawn failed: tmux launched but channel never registered with session-bridge within 20s"}
 
-        # Daemon down — direct path.
-        conn = store.get_db()
-        try:
-            success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
-        except spawner.ChannelResolutionError as e:
-            conn.close()
-            return {"error": f"channel validation failed: {e}"}
+    store.update_status(conn, task_id, "running")
+    store.increment_invocation(conn, task_id)
+    conn.close()
 
-        if not success:
-            conn.close()
-            return {"error": "spawn failed: tmux launched but channel never registered with session-bridge within 20s"}
+    spawner.send_initial_prompt(task_id, task["description"])
 
-        # Update status
-        store.update_status(conn, task_id, "running")
-        store.increment_invocation(conn, task_id)
-        conn.close()
-
-        # Send initial task prompt via session-bridge
-        spawner.send_initial_prompt(task_id, task["description"])
-
-        return {
-            "status": "running",
-            "task_id": task_id,
-            "kind": "task",
-            "tmux_session": spawner.tmux_session_name(task_id),
-            # spawn_tmux confirmed channel before returning success.
-            "channel_healthy": True,
-        }
+    return {
+        "status": "running",
+        "task_id": task_id,
+        "kind": kind,
+        "tmux_session": spawner.tmux_session_name(task_id),
+        "channel_healthy": True,
+    }
 
 
 @mcp.tool()
@@ -374,29 +342,25 @@ def kill_task(task_id: str) -> dict:
         return {"error": f"Task '{task_id}' not found"}
 
     kind = task.get("kind", "task")
+    conn.close()
 
-    # For kind=task, try daemon first (it owns the lifecycle going forward).
-    # kind=service still uses systemd until phase 2.
-    if kind == "task":
-        conn.close()
-        daemon_result = _daemon_call("POST", f"/tasks/{task_id}/kill")
-        if daemon_result is not None:
-            return daemon_result
-        conn = store.get_db()  # daemon down — fall through to direct path
+    # Both kinds route through the daemon when available.
+    daemon_result = _daemon_call("POST", f"/tasks/{task_id}/kill")
+    if daemon_result is not None:
+        return daemon_result
 
+    # Daemon down — direct path.
+    conn = store.get_db()
+
+    # If the task was created under the legacy per-task systemd model, tear
+    # the unit down too. Tasks created post-daemon have no unit and this is
+    # a no-op.
     service_removed = False
-
-    # For services, stop and disable the systemd unit
     if kind == "service":
         service_removed = spawner.uninstall_service(task_id)
 
-    # Kill tmux (safety net for services, primary for tasks)
     tmux_killed = spawner.kill_tmux(task_id)
-
-    # Clean up project-scoped MCPs this task registered
     spawner.cleanup_project_mcps(task_id)
-
-    # Update DB
     store.update_status(conn, task_id, "killed")
     conn.close()
 
@@ -407,7 +371,6 @@ def kill_task(task_id: str) -> dict:
     }
     if kind == "service":
         result["service_removed"] = service_removed
-
     return result
 
 

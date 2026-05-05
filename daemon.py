@@ -18,6 +18,7 @@ fictions, and split state are the price. This daemon collapses those concerns
 into one process.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ import store
 
 DEFAULT_PORT = 8912
 TASKPILOT_DIR = Path.home() / ".taskpilot"
+RECONCILE_INTERVAL_S = int(os.environ.get("TASKPILOT_RECONCILE_INTERVAL_S", "60"))
 
 log = logging.getLogger("taskpilot.daemon")
 
@@ -56,14 +58,123 @@ class MessageRequest(BaseModel):
     from_session: str | None = None
 
 
+# --- Reconciler ---
+#
+# Phase 2: every RECONCILE_INTERVAL_S seconds the daemon walks tasks with
+# status='running' and reconciles DB ↔ reality:
+#   - tmux alive → stamp last_seen_at (heartbeat)
+#   - tmux dead, kind=service → respawn (the supervisor part)
+#   - tmux dead, kind=task    → mark crashed (one-shot semantics)
+#
+# This single tick subsumes three concerns previously split across files:
+#   • boot-time spawn-up of services (replaces per-task systemd units that
+#     ran start.sh on boot)
+#   • crash recovery (replaces the bash while-loop that respawned claude
+#     when it exited inside its tmux session)
+#   • liveness reconciliation (replaces the standalone liveness.py timer)
+
+
+def _spawn_body(task: dict) -> None:
+    """Synchronous spawn for one task. Used by /spawn endpoint and reconciler.
+
+    Raises spawner.ChannelResolutionError on bad channels, RuntimeError on
+    spawn failures (callers convert to HTTP errors or log).
+    """
+    task_id = task["task_id"]
+    plugins = json.loads(task["plugins"]) if task["plugins"] else []
+    model = task.get("model")
+    cwd = task.get("cwd")
+    channels = json.loads(task["channels"]) if task.get("channels") else []
+    kind = task.get("kind", "task")
+
+    success = spawner.spawn_tmux(
+        task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind,
+    )
+    if not success:
+        raise RuntimeError(
+            f"spawn failed for {task_id}: tmux launched but channel never registered"
+        )
+
+
+def reconcile_once() -> dict:
+    """One reconciler pass. Returns counts for logging/metrics.
+
+    Read DB, check tmux for each running task, take action, write DB back.
+    Synchronous so we can run it via asyncio.to_thread from the loop.
+    """
+    counts = {"checked": 0, "alive": 0, "respawned": 0, "crashed": 0, "failed": 0}
+    conn = store.get_db()
+    try:
+        running = store.list_tasks(conn, "running")
+    except Exception as e:
+        conn.close()
+        log.error("reconcile: failed to list tasks: %s", e)
+        return counts
+
+    for task in running:
+        task_id = task["task_id"]
+        kind = task.get("kind", "task")
+        counts["checked"] += 1
+
+        if spawner.is_tmux_alive(task_id):
+            store.mark_seen(conn, task_id)
+            counts["alive"] += 1
+            continue
+
+        # tmux died. Service-kind: try to bring it back. Task-kind: mark crashed.
+        if kind == "service":
+            log.warning("reconcile: tmux dead for service %s — respawning", task_id)
+            try:
+                _spawn_body(task)
+                store.increment_invocation(conn, task_id)
+                counts["respawned"] += 1
+            except Exception as e:
+                log.error("reconcile: respawn of %s failed: %s", task_id, e)
+                store.mark_crashed(conn, task_id, f"reconciler respawn failed: {e}")
+                counts["failed"] += 1
+        else:
+            log.info("reconcile: tmux dead for task %s — marking crashed", task_id)
+            store.mark_crashed(conn, task_id, "tmux died (reconciler)")
+            counts["crashed"] += 1
+
+    conn.close()
+    return counts
+
+
+async def reconcile_loop() -> None:
+    """Background async loop. Runs reconcile_once on RECONCILE_INTERVAL_S cadence.
+
+    First pass fires immediately on daemon boot — that's what brings services
+    back up after a host reboot. Sleep is at the *end* so a slow tick doesn't
+    delay the next tick beyond the interval.
+    """
+    while True:
+        try:
+            counts = await asyncio.to_thread(reconcile_once)
+            if any(counts[k] for k in ("respawned", "crashed", "failed")):
+                log.info(
+                    "reconcile: checked=%d alive=%d respawned=%d crashed=%d failed=%d",
+                    counts["checked"], counts["alive"], counts["respawned"],
+                    counts["crashed"], counts["failed"],
+                )
+        except Exception as e:
+            log.exception("reconcile: unhandled error: %s", e)
+        await asyncio.sleep(RECONCILE_INTERVAL_S)
+
+
 # --- Lifespan ---
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("taskpilot daemon starting")
-    # Phase 0: nothing to reconcile. Phase 1 will start a heartbeat tick here.
+    log.info("taskpilot daemon starting (reconcile interval=%ds)", RECONCILE_INTERVAL_S)
+    task = asyncio.create_task(reconcile_loop())
     yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     log.info("taskpilot daemon stopping")
 
 
@@ -150,14 +261,18 @@ def get_log(task_id: str, lines: int = 50) -> dict:
     return {"task_id": task_id, "output": "\n".join(output_lines[-lines:])}
 
 
-# --- Write endpoints (phase 1 — kind=task only; kind=service still on systemd) ---
+# --- Write endpoints ---
+#
+# As of phase 2, /spawn and /kill handle both kind=task and kind=service.
+# The difference is reconciler treatment, not spawn-path: services auto-respawn
+# on tmux death, tasks get marked crashed. Spawn itself is the same call into
+# spawner.spawn_tmux for both — no per-task systemd, no start.sh, no while-loop
+# (the daemon's reconciler is the supervisor now).
 
 
 @app.post("/tasks/{task_id}/spawn")
 def spawn(task_id: str) -> dict:
-    """Spawn a task in tmux. Phase 1 supports kind=task only; service-kind tasks
-    continue to be created by server.py via the per-task systemd unit until
-    phase 2 migrates them under the daemon."""
+    """Spawn a task in tmux."""
     conn = store.get_db()
     task = store.get_task(conn, task_id)
     if not task:
@@ -167,33 +282,14 @@ def spawn(task_id: str) -> dict:
         conn.close()
         raise HTTPException(status_code=409, detail=f"task '{task_id}' is already running")
 
-    kind = task.get("kind", "task")
-    if kind == "service":
-        conn.close()
-        raise HTTPException(
-            status_code=501,
-            detail="kind=service spawn via daemon: phase 2 not yet implemented",
-        )
-
-    plugins = json.loads(task["plugins"]) if task["plugins"] else []
-    model = task.get("model")
-    cwd = task.get("cwd")
-    channels = json.loads(task["channels"]) if task.get("channels") else []
-
     try:
-        success = spawner.spawn_tmux(
-            task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind,
-        )
+        _spawn_body(task)
     except spawner.ChannelResolutionError as e:
         conn.close()
         raise HTTPException(status_code=400, detail=f"channel validation failed: {e}")
-
-    if not success:
+    except RuntimeError as e:
         conn.close()
-        raise HTTPException(
-            status_code=502,
-            detail="spawn failed: tmux launched but channel never registered with session-bridge within 20s",
-        )
+        raise HTTPException(status_code=502, detail=str(e))
 
     store.update_status(conn, task_id, "running")
     store.increment_invocation(conn, task_id)
@@ -204,7 +300,7 @@ def spawn(task_id: str) -> dict:
     return {
         "status": "running",
         "task_id": task_id,
-        "kind": "task",
+        "kind": task.get("kind", "task"),
         "tmux_session": spawner.tmux_session_name(task_id),
         "channel_healthy": True,
     }
@@ -212,20 +308,13 @@ def spawn(task_id: str) -> dict:
 
 @app.post("/tasks/{task_id}/kill")
 def kill(task_id: str) -> dict:
-    """Kill a running task. Phase 1: kind=task only."""
+    """Kill a running task. Reconciler doesn't touch killed tasks (its filter
+    is status='running'), so killing a service stops the auto-respawn cycle."""
     conn = store.get_db()
     task = store.get_task(conn, task_id)
     if not task:
         conn.close()
         raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
-
-    kind = task.get("kind", "task")
-    if kind == "service":
-        conn.close()
-        raise HTTPException(
-            status_code=501,
-            detail="kind=service kill via daemon: phase 2 not yet implemented",
-        )
 
     tmux_killed = spawner.kill_tmux(task_id)
     spawner.cleanup_project_mcps(task_id)
@@ -275,7 +364,74 @@ def message(task_id: str, body: MessageRequest) -> dict:
 # --- Entry point ---
 
 
+# --- Systemd user unit installation ---
+
+
+SYSTEMD_UNIT_NAME = "taskpilot-daemon.service"
+SYSTEMD_UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME
+
+
+def _systemd_unit_text() -> str:
+    """Render the taskpilot-daemon.service unit file.
+
+    Hardcoded paths are intentional — systemd resolves nothing from PATH and
+    refuses to substitute env vars in ExecStart. The exempt-for-local-config
+    carveout in the projects CLAUDE.md applies.
+    """
+    py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip() or "/usr/bin/python3"
+    daemon_py = str(Path(__file__).resolve())
+    return f"""[Unit]
+Description=Taskpilot supervisor daemon
+Documentation=https://github.com/softwaresoftware-dev/taskpilot
+After=network.target session-bridge.service
+Wants=session-bridge.service
+
+[Service]
+Type=simple
+ExecStart={py} {daemon_py}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def install_systemd_unit() -> None:
+    """Write the unit file, daemon-reload, enable, start. Idempotent."""
+    SYSTEMD_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEMD_UNIT_PATH.write_text(_systemd_unit_text())
+    print(f"wrote {SYSTEMD_UNIT_PATH}")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", SYSTEMD_UNIT_NAME], check=True)
+    subprocess.run(["systemctl", "--user", "restart", SYSTEMD_UNIT_NAME], check=True)
+    print(f"enabled and started {SYSTEMD_UNIT_NAME}")
+
+
+def uninstall_systemd_unit() -> None:
+    """Stop, disable, remove unit file. Idempotent."""
+    subprocess.run(["systemctl", "--user", "stop", SYSTEMD_UNIT_NAME], check=False)
+    subprocess.run(["systemctl", "--user", "disable", SYSTEMD_UNIT_NAME], check=False)
+    if SYSTEMD_UNIT_PATH.exists():
+        SYSTEMD_UNIT_PATH.unlink()
+        print(f"removed {SYSTEMD_UNIT_PATH}")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    print(f"uninstalled {SYSTEMD_UNIT_NAME}")
+
+
+# --- Entry point ---
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--install":
+        install_systemd_unit()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--uninstall":
+        uninstall_systemd_unit()
+        return
+
     port = int(os.environ.get("TASKPILOT_DAEMON_PORT", DEFAULT_PORT))
     bind = os.environ.get("TASKPILOT_DAEMON_BIND", "127.0.0.1")
     logging.basicConfig(
