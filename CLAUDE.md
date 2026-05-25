@@ -17,6 +17,29 @@ Spawn and manage long-running autonomous Claude Code sessions. Each task runs in
 - session-bridge (message routing)
 - A single `taskpilot-daemon.service` systemd user unit supervises all tasks
 
+## Platform support
+
+Linux and macOS natively (tmux dep). **Windows: via WSL2** — Claude Code
+runs inside the WSL distro, taskpilot installs and behaves identically to
+native Linux from inside WSL. There is no Windows-native code path because
+spawning + supervising claude subprocesses currently goes through tmux;
+porting that to plain `subprocess.Popen` + log-tail (instead of attach) is
+on the roadmap.
+
+The marketplace `environment` stays `{os: [linux, darwin]}` so the resolver
+refuses install on native Windows — operators get a clear failure rather
+than a half-working install. Inside WSL, `probe_os` returns "linux" so the
+resolver accepts the install transparently.
+
+WSL setup gotchas for taskpilot specifically:
+
+- The dispatcher and dashboard are daemons. WSL2 shuts down when all
+  shells exit — keep one open, or enable systemd in `wsl.conf` and run
+  `wsl --shutdown-timeout` so units survive.
+- Webhook ingress works via Cloudflare tunnel running inside WSL.
+- Notifications: `notify-send` doesn't work without WSLg + a display
+  server. Use `notify-slack` / `notify-email` instead.
+
 ## How It Works
 
 1. `create_task()` writes config to `~/.taskpilot/<id>/`.
