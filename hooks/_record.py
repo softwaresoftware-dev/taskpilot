@@ -18,8 +18,27 @@ def task_id() -> str | None:
     return os.environ.get("TASKPILOT_TASK_ID") or None
 
 
+def taskpilot_dir() -> Path:
+    """Resolve the real ~/.taskpilot/ — NOT the sandboxed HOME's ~/.taskpilot/.
+
+    The spawner exports $TASKPILOT_HOME pointing at the host's real
+    `~/.taskpilot/` before overriding HOME to the sandbox dir. Without this
+    env var, `Path.home() / .taskpilot` resolves to
+    `~/.taskpilot/<task_id>/.taskpilot/` inside the agent — nested, wrong,
+    invisible to the daemon. With the env var, the hooks and daemon read
+    the same directory.
+
+    Falls back to `Path.home() / .taskpilot` for direct invocations
+    (tests, scripts) where the env var isn't set.
+    """
+    override = os.environ.get("TASKPILOT_HOME")
+    if override:
+        return Path(override)
+    return Path.home() / ".taskpilot"
+
+
 def state_dir(tid: str) -> Path:
-    d = Path.home() / ".taskpilot" / tid / "state"
+    d = taskpilot_dir() / tid / "state"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

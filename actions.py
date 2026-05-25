@@ -19,7 +19,11 @@ import store
 
 logger = logging.getLogger(__name__)
 
-TASKPILOT_DIR = Path.home() / ".taskpilot"
+# Honor $TASKPILOT_HOME (set by the spawner) so hook scripts running inside
+# a sandboxed agent write escalations.jsonl to the real ~/.taskpilot/<id>/,
+# not to the nested ~/.taskpilot/<id>/.taskpilot/<id>/ that
+# `Path.home() / .taskpilot` resolves to inside the sandbox.
+TASKPILOT_DIR = Path(os.environ["TASKPILOT_HOME"]) if os.environ.get("TASKPILOT_HOME") else Path.home() / ".taskpilot"
 
 # Time to wait after toggling pipe-pane off before writing the completion
 # separator. tmux closes the pipe FD synchronously; the cat child receives

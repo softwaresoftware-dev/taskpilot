@@ -1,11 +1,21 @@
 """SQLite storage layer for taskpilot."""
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_DB_PATH = Path.home() / ".taskpilot" / "taskpilot.db"
+# Honor $TASKPILOT_HOME so hook scripts running inside a sandboxed agent
+# hit the daemon's real DB at ~/.taskpilot/taskpilot.db rather than a
+# per-task copy under the sandbox HOME. Without this override,
+# `mark_completed_and_kill` writes "completed" to a DB the daemon never
+# reads → status stuck at "running" + stale tmux.
+DEFAULT_DB_PATH = (
+    Path(os.environ["TASKPILOT_HOME"]) / "taskpilot.db"
+    if os.environ.get("TASKPILOT_HOME")
+    else Path.home() / ".taskpilot" / "taskpilot.db"
+)
 PORT_RANGE_START = 9100
 
 

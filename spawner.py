@@ -685,13 +685,21 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     #
     # Env exports:
     #   TASKPILOT_TASK_ID — for capability plugins that scope storage per task
+    #   TASKPILOT_HOME    — the REAL ~/.taskpilot/ on the host, so hook scripts
+    #                       inside the sandbox can find the daemon's DB and
+    #                       write state to a path the daemon reads. Without
+    #                       this, `Path.home() / .taskpilot` inside the sandbox
+    #                       resolves to ~/.taskpilot/<id>/.taskpilot/ — nested,
+    #                       invisible to the daemon, breaking auto-completion.
     #   SESSION_NAME      — read by session-bridge channel.mjs at /register
     #   SESSION_NAMESPACE — same
     #   SESSION_LABELS    — same
     #   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false — no human is at the keyboard
     #     in a spawned agent, so the forked-suggestion LLM call is pure waste.
+    real_taskpilot_dir = str(Path.home() / ".taskpilot")
     cmd = f"""export HOME={home}
 export TASKPILOT_TASK_ID={task_id}
+export TASKPILOT_HOME={real_taskpilot_dir}
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export SESSION_LABELS={labels}
