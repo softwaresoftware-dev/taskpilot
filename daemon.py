@@ -393,6 +393,18 @@ LAUNCHD_LABEL = "com.softwaresoftware.taskpilot-daemon"
 LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 
+def _resolve_uv() -> str:
+    """Find an absolute path to the `uv` binary, falling back to bare 'uv'.
+
+    The daemon's plugin deps (mcp, fastapi, uvicorn) live in the plugin's uv
+    venv, not in system python. Bare `python3` here would fail to import
+    fastapi the first time the unit starts. `uv run --directory <plugin>` is
+    the only invocation that finds the right interpreter on every host.
+    """
+    found = subprocess.run(["which", "uv"], capture_output=True, text=True).stdout.strip()
+    return found or "uv"
+
+
 def _systemd_unit_text() -> str:
     """Render the taskpilot-daemon.service unit file.
 
@@ -400,8 +412,8 @@ def _systemd_unit_text() -> str:
     refuses to substitute env vars in ExecStart. The exempt-for-local-config
     carveout in the projects CLAUDE.md applies.
     """
-    py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip() or "/usr/bin/python3"
-    daemon_py = str(Path(__file__).resolve())
+    uv = _resolve_uv()
+    plugin_root = str(Path(__file__).resolve().parent)
     return f"""[Unit]
 Description=Taskpilot supervisor daemon
 Documentation=https://github.com/softwaresoftware-dev/taskpilot
@@ -410,7 +422,7 @@ Wants=session-bridge.service
 
 [Service]
 Type=simple
-ExecStart={py} {daemon_py}
+ExecStart={uv} run --directory {plugin_root} python daemon.py
 Restart=on-failure
 RestartSec=5
 # Only kill the daemon's main process on stop, not its descendants. The
@@ -456,8 +468,8 @@ def _launchd_plist_text() -> str:
     those down when it stops/restarts the daemon. KeepAlive.SuccessfulExit=false
     mirrors `Restart=on-failure` — restart on crash, not on a clean exit.
     """
-    py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip() or "/usr/bin/python3"
-    daemon_py = str(Path(__file__).resolve())
+    uv = _resolve_uv()
+    plugin_root = str(Path(__file__).resolve().parent)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -466,8 +478,12 @@ def _launchd_plist_text() -> str:
     <string>{LAUNCHD_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{py}</string>
-        <string>{daemon_py}</string>
+        <string>{uv}</string>
+        <string>run</string>
+        <string>--directory</string>
+        <string>{plugin_root}</string>
+        <string>python</string>
+        <string>daemon.py</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
