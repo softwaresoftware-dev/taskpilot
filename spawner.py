@@ -7,6 +7,7 @@ session-bridge channel.mjs reads that env var and includes it in its
 """
 
 import json
+import logging
 import os
 import re
 import shlex
@@ -18,6 +19,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 TASKPILOT_DIR = Path.home() / ".taskpilot"
 CLAUDE_JSON = Path.home() / ".claude.json"
@@ -621,11 +624,68 @@ def write_hook_settings(task_id: str) -> Path:
     return path
 
 
+def _user_login_path() -> str:
+    """Capture the user's full PATH by asking their login shell.
+
+    This reproduces what Claude Code's own shell-snapshot (and the desktop app)
+    do to resolve PATH. The sandbox redirects HOME, which blinds Claude Code's
+    snapshot — it reads the now-empty sandbox shell config — so a spawned agent
+    would otherwise see only the lean `bash -lc` PATH and miss tools configured
+    in the user's rc files (gcloud, conda, nvm-managed node, sf, etc.).
+
+    We run the user's *actual* login shell (zsh on macOS, bash on Linux/WSL)
+    as a login + interactive shell so it sources both profile and rc files,
+    then read PATH back. The shell is detected from the passwd entry (falling
+    back to $SHELL, then bash) rather than hardcoded, so this is correct across
+    OSes. Markers fence the value so any rc-file stdout chatter can't corrupt
+    it. Falls back to the current process PATH on any failure.
+
+    Security is intentionally not a concern: spawned agents run as the same OS
+    user with their permissions, so surfacing the user's full toolchain is the
+    goal. The sandbox is a curation mechanism (which plugins/MCPs/state a task
+    gets), not a containment boundary.
+    """
+    fallback = os.environ.get("PATH", "")
+    shell = ""
+    try:
+        import pwd
+
+        shell = pwd.getpwuid(os.getuid()).pw_shell or ""
+    except Exception:  # noqa: BLE001
+        pass
+    if not shell or not Path(shell).exists():
+        shell = os.environ.get("SHELL", "") or shutil.which("bash") or "/bin/sh"
+    sentinel = "__TPPATH__"
+    try:
+        result = subprocess.run(
+            [shell, "-ilc", f'printf "{sentinel}%s{sentinel}" "$PATH"'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("login-shell PATH capture failed (%s); using process PATH", e)
+        return fallback
+    out = result.stdout or ""
+    start = out.find(sentinel)
+    end = out.rfind(sentinel)
+    if start == -1 or end <= start:
+        log.warning("login-shell PATH capture returned no marker; using process PATH")
+        return fallback
+    captured = out[start + len(sentinel):end]
+    return captured or fallback
+
+
 def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
                cwd: str | None = None, channels: list[str] | None = None,
                kind: str = "task", enabled_plugins: list[str] | None = None,
-               enabled_mcps: list[str] | None = None) -> bool:
-    """Launch the Claude session in tmux. Messaging goes through session-bridge."""
+               enabled_mcps: list[str] | None = None,
+               resume_session_id: str | None = None) -> bool:
+    """Launch the Claude session in tmux. Messaging goes through session-bridge.
+
+    resume_session_id: when set, launch with `claude --resume <id>` so the agent
+    wakes back into its existing conversation (used to wake a dormant agent)."""
     session = tmux_session_name(task_id)
     # Default cwd is the task dir, which is also the sandbox $HOME — keeping
     # cwd == $HOME stops Claude's project-config walk from escaping the
@@ -696,15 +756,28 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     #   SESSION_LABELS    — same
     #   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false — no human is at the keyboard
     #     in a spawned agent, so the forked-suggestion LLM call is pure waste.
+    #   PATH — captured from the user's login shell (see _user_login_path).
+    #     The sandbox redirects HOME, which blinds Claude Code's own
+    #     shell-snapshot PATH capture (it reads the empty sandbox config), so
+    #     the agent would otherwise miss tools configured in the user's rc files
+    #     (gcloud, conda, nvm-managed node, etc.). We reproduce that capture and
+    #     inject the result, keeping $PATH as a fallback. The sandbox is a
+    #     curation mechanism, not a security boundary — agents run as the same
+    #     user with their permissions by design — so surfacing the full
+    #     toolchain is intended.
     real_taskpilot_dir = str(Path.home() / ".taskpilot")
+    agent_path = _user_login_path()
+    # Wake path: resume the agent's existing conversation instead of cold-starting.
+    resume_flag = f" --resume {resume_session_id}" if resume_session_id else ""
     cmd = f"""export HOME={home}
+export PATH="{agent_path}:$PATH"
 export TASKPILOT_TASK_ID={task_id}
 export TASKPILOT_HOME={real_taskpilot_dir}
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export SESSION_LABELS={labels}
 export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
-cd {td} && claude --dangerously-skip-permissions \\
+cd {td} && claude --dangerously-skip-permissions{resume_flag} \\
   --dangerously-load-development-channels {channels_arg} \\
   --settings {hook_settings} \\
   {plugin_flags}{model_flag} \\
@@ -733,15 +806,25 @@ cd {td} && claude --dangerously-skip-permissions \\
     time.sleep(4)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
 
-    # Wait for session-bridge to register the session by name. If the channel
-    # never comes up (validate_channels passed but something else went wrong —
-    # bridge daemon down, claude crashed during boot, etc.), report failure
-    # rather than silently returning success.
-    if not wait_for_channel(task_id, timeout=20):
-        return False
-
-    # Brief settle time for MCP connection
-    time.sleep(3)
+    # Best-effort wait for session-bridge to register the channel by name.
+    # Channel registration is eventually-consistent: channel.mjs re-registers
+    # on its heartbeat whenever the bridge becomes reachable. So a slow or
+    # momentarily-unreachable bridge is NOT a spawn failure — the tmux+claude
+    # process is up, and the channel converges on its own once the bridge is
+    # back. Treating the timeout as failure here (and letting the reconciler
+    # mark the service 'crashed') was the cause of spurious "channel never
+    # registered" crashes when a service was respawned while session-bridge
+    # was briefly down. A successful tmux launch == spawned.
+    if wait_for_channel(task_id, timeout=20):
+        # Channel live — brief settle time for the MCP connection.
+        time.sleep(3)
+    else:
+        log.warning(
+            "spawn %s: tmux up but channel not registered within 20s; "
+            "proceeding anyway — channel.mjs will re-register on its heartbeat "
+            "once session-bridge is reachable",
+            task_id,
+        )
     return True
 
 
@@ -779,6 +862,17 @@ def is_tmux_alive(task_id: str) -> bool:
         capture_output=True,
     )
     return result.returncode == 0
+
+
+def capture_session_id(task_id: str) -> str | None:
+    """The Claude session UUID for this agent, read from its newest transcript
+    file (<sandbox HOME>/.claude/projects/<hash>/<session_id>.jsonl). Returns
+    None until the agent has run at least one turn. Used to resume on wake."""
+    proj = sandbox_home(task_id) / ".claude" / "projects"
+    if not proj.exists():
+        return None
+    files = sorted(proj.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0].stem if files else None
 
 
 def channel_healthy(task_id: str) -> bool:

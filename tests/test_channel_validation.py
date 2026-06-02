@@ -125,3 +125,35 @@ class TestWaitForChannel:
              patch.object(spawner.time, "sleep"):
             assert spawner.wait_for_channel("my-task", timeout=0) is False
             mock_check.assert_not_called()
+
+
+class TestSpawnTmuxChannelPatience:
+    """A channel that doesn't register within the wait window is NOT a spawn
+    failure: registration is eventually-consistent via channel.mjs's heartbeat,
+    which re-registers once the bridge is reachable. spawn_tmux must return True
+    (spawned) so the reconciler doesn't mark a briefly-bridgeless service
+    'crashed'. Only an actual tmux launch failure returns False.
+    """
+
+    def _patch_internals(self, monkeypatch):
+        monkeypatch.setattr(spawner, "write_hook_settings", lambda tid: "/tmp/hs.json")
+        monkeypatch.setattr(spawner, "prepare_sandbox", lambda *a, **k: "/tmp/home")
+        monkeypatch.setattr(spawner, "validate_channels", lambda chans: None)
+        monkeypatch.setattr(spawner, "_setup_pane_log_capture", lambda *a, **k: None)
+        monkeypatch.setattr(spawner.time, "sleep", lambda *a, **k: None)
+
+    def test_returns_true_when_channel_pending(self, monkeypatch):
+        # tmux launches fine, but the channel never registers in the window.
+        self._patch_internals(monkeypatch)
+        monkeypatch.setattr(spawner, "wait_for_channel", lambda *a, **k: False)
+        ok = type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        monkeypatch.setattr(spawner.subprocess, "run", lambda *a, **k: ok)
+        assert spawner.spawn_tmux("svc-1", [], kind="service") is True
+
+    def test_returns_false_when_tmux_launch_fails(self, monkeypatch):
+        # Even with a healthy channel, a tmux launch failure is a real failure.
+        self._patch_internals(monkeypatch)
+        monkeypatch.setattr(spawner, "wait_for_channel", lambda *a, **k: True)
+        fail = type("P", (), {"returncode": 1, "stdout": "", "stderr": "boom"})()
+        monkeypatch.setattr(spawner.subprocess, "run", lambda *a, **k: fail)
+        assert spawner.spawn_tmux("svc-1", [], kind="service") is False

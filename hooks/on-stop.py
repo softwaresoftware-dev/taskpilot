@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Stop hook for taskpilot agents.
 
-Fires when the assistant finishes a turn. Two responsibilities:
+Fires when the assistant finishes a turn. Responsibilities:
 
 1. Record the final assistant message + timestamp to state/agent.json.
-2. Classify the message and act:
-     resolved   → mark task completed in the DB and tear down tmux.
-     question   → log an escalation and (if configured) fire a notification.
-     uneventful → do nothing; agent stays at the prompt for further input.
+2. Stamp last activity (last_seen_at) so the idle clock resets each turn.
+
+NOTE: this hook used to run an LLM/regex classifier and KILL the agent when its
+message "looked done." That was removed — completion is no longer inferred from
+prose. Going idle just lets the reconciler recycle the agent to 'dormant' (it
+wakes on the next message). Completion, if ever needed, is an explicit signal,
+not a guess. See daemon.py reconcile + wake-on-message.
 """
 
 import sys
@@ -20,8 +23,6 @@ sys.path.insert(0, str(HOOKS_DIR))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from _record import mark_seen, now_iso, read_event, task_id, write_record
-import actions
-import classifier
 
 
 def main() -> int:
@@ -43,12 +44,8 @@ def main() -> int:
     }
     write_record(tid, "last_stop", record)
     mark_seen(tid)
-
-    bucket = classifier.classify(message, tid)
-    if bucket == "resolved":
-        actions.mark_completed_and_kill(tid)
-    elif bucket == "question":
-        actions.notify_human(tid, message)
+    # No classification, no completion-kill. Idle is handled by the reconciler
+    # (recycle to 'dormant'), not by guessing the agent is "done" from its words.
     return 0
 
 

@@ -313,3 +313,87 @@ class TestReconciler:
         t = store.get_task(conn, "svc-dead")
         conn.close()
         assert t["status"] == "crashed"
+
+
+class TestDormancyAndWake:
+    """Time-based lifecycle: idle agents recycle to 'dormant'; a message wakes
+    them (resumed). No prose-classification kill anywhere."""
+
+    def test_idle_running_task_goes_dormant(self, db_path):
+        conn = _real_get_db(db_path)
+        store.create_task(conn, "t1", "test", "desc", [], {}, None, None, [], kind="service")
+        store.update_status(conn, "t1", "running")
+        # last activity far in the past -> idle past TTL
+        conn.execute("UPDATE tasks SET last_seen_at = '2000-01-01 00:00:00' WHERE task_id = 't1'")
+        conn.commit()
+        conn.close()
+        with (
+            patch("daemon.IDLE_TTL_S", 3600),
+            patch("daemon.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch("daemon.spawner.is_tmux_alive", return_value=True),
+            patch("daemon.spawner.capture_session_id", return_value="sess-1"),
+            patch("daemon.spawner.kill_tmux", return_value=True) as mock_kill,
+        ):
+            counts = daemon.reconcile_once()
+        assert counts["dormant"] == 1
+        mock_kill.assert_called_once_with("t1")
+        conn = _real_get_db(db_path)
+        t = store.get_task(conn, "t1")
+        conn.close()
+        assert t["status"] == "dormant"          # not 'completed', not 'crashed'
+        assert t["session_id"] == "sess-1"        # captured for resume-on-wake
+
+    def test_active_running_task_stays_alive(self, db_path):
+        conn = _real_get_db(db_path)
+        store.create_task(conn, "t1", "test", "desc", [], {}, None, None, [], kind="service")
+        store.update_status(conn, "t1", "running")
+        store.mark_seen(conn, "t1")               # just active
+        conn.close()
+        with (
+            patch("daemon.IDLE_TTL_S", 3600),
+            patch("daemon.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch("daemon.spawner.is_tmux_alive", return_value=True),
+            patch("daemon.spawner.capture_session_id", return_value=None),
+            patch("daemon.spawner.kill_tmux") as mock_kill,
+        ):
+            counts = daemon.reconcile_once()
+        assert counts["alive"] == 1
+        assert counts["dormant"] == 0
+        mock_kill.assert_not_called()
+
+    def test_message_wakes_dormant_with_resume(self, client, db_path):
+        conn = _real_get_db(db_path)
+        store.create_task(conn, "t1", "test", "desc", [], {}, None, None, [], kind="service")
+        store.update_status(conn, "t1", "dormant")
+        store.set_session_id(conn, "t1", "sess-9")
+        conn.close()
+
+        class FakeProc:
+            returncode = 0
+            stdout = "ok"
+
+        with (
+            patch("daemon.spawner.channel_healthy", return_value=False),
+            patch("daemon._spawn_body") as mock_spawn,
+            patch("daemon.spawner.wait_for_channel", return_value=True),
+            patch("daemon.subprocess.run", return_value=FakeProc()),
+        ):
+            r = client.post("/tasks/t1/message", json={"text": "hi"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["woke"] is True
+        assert body["delivered"] is True
+        # woke resumed into the stored session
+        assert mock_spawn.call_args.kwargs.get("resume_session_id") == "sess-9"
+        conn = _real_get_db(db_path)
+        assert store.get_task(conn, "t1")["status"] == "running"
+        conn.close()
+
+    def test_message_to_completed_not_woken(self, client, db_path):
+        conn = _real_get_db(db_path)
+        store.create_task(conn, "t1", "test", "desc", [], {}, None, None, [])
+        store.update_status(conn, "t1", "completed")
+        conn.close()
+        with patch("daemon.spawner.channel_healthy", return_value=False):
+            r = client.post("/tasks/t1/message", json={"text": "hi"})
+        assert r.status_code == 502           # not dormant -> not auto-woken

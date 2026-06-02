@@ -122,6 +122,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN enabled_mcps TEXT DEFAULT '[]'")
         conn.commit()
 
+    # Migrate: session_id — the Claude session UUID, captured once the agent
+    # has run a turn. Lets a dormant agent be resumed into the same conversation
+    # on wake (claude --resume <id>).
+    try:
+        conn.execute("SELECT session_id FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN session_id TEXT DEFAULT NULL")
+        conn.commit()
+
 
 def allocate_port(conn: sqlite3.Connection) -> int:
     """Find the next available port starting from PORT_RANGE_START."""
@@ -199,11 +208,25 @@ def increment_invocation(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def mark_seen(conn: sqlite3.Connection, task_id: str) -> None:
-    """Stamp last_seen_at = now. Called whenever the agent emits a hook or the
-    liveness reconciler confirms the tmux session is alive."""
+    """Stamp last_seen_at = now. last_seen_at means LAST ACTIVITY (a turn or an
+    inbound message), stamped by the agent's lifecycle hooks. The reconciler no
+    longer stamps it on mere tmux-aliveness, so idle can be measured from it."""
     conn.execute(
         "UPDATE tasks SET last_seen_at = datetime('now') WHERE task_id = ?",
         (task_id,),
+    )
+    conn.commit()
+
+
+def set_session_id(conn: sqlite3.Connection, task_id: str, session_id: str) -> None:
+    """Record the Claude session UUID (once), so a dormant agent can be resumed
+    into the same conversation on wake. No-op if already set or sid is falsy."""
+    if not session_id:
+        return
+    conn.execute(
+        "UPDATE tasks SET session_id = ? WHERE task_id = ? "
+        "AND (session_id IS NULL OR session_id = '')",
+        (session_id, task_id),
     )
     conn.commit()
 

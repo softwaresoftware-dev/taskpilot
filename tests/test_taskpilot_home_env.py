@@ -82,18 +82,64 @@ def test_actions_taskpilot_dir_honors_env(real_taskpilot_dir):
     assert str(actions.TASKPILOT_DIR) == str(real_tp)
 
 
-def test_no_nested_path_under_any_resolution(real_taskpilot_dir):
-    """Belt-and-suspenders: the nested ~/.taskpilot/<id>/.taskpilot/ pattern
-    must not appear in any of the resolved paths. That was the bug shape."""
-    real_tp, sandbox = real_taskpilot_dir
+def test_classifier_taskpilot_dir_honors_env(real_taskpilot_dir):
+    real_tp, _ = real_taskpilot_dir
     sys.path.insert(0, str(HOOKS_DIR.parent))
-    for mod in ("_record", "store", "actions"):
+    for mod in ("classifier",):
         if mod in sys.modules:
             del sys.modules[mod]
-    import _record, store, actions
+    import classifier
+    assert str(classifier._TASKPILOT_DIR) == str(real_tp)
+
+
+def test_classifier_loads_brief_from_real_dir(real_taskpilot_dir):
+    """The actual bug: inside the sandbox, _load_brief read from the nested
+    Path.home() path and silently returned {} — so the judge ran blind to
+    success_criteria. It must read brief.json from the real $TASKPILOT_HOME."""
+    import json as _json
+
+    real_tp, _ = real_taskpilot_dir
+    sys.path.insert(0, str(HOOKS_DIR.parent))
+    for mod in ("classifier",):
+        if mod in sys.modules:
+            del sys.modules[mod]
+    import classifier
+
+    tid = "brief-task"
+    brief = {"success_criteria": ["Buyer confirmed and payment received"]}
+    brief_dir = real_tp / tid
+    brief_dir.mkdir(parents=True)
+    (brief_dir / "brief.json").write_text(_json.dumps(brief))
+
+    loaded = classifier._load_brief(tid)
+    assert loaded == brief, f"brief not loaded from real dir: {loaded!r}"
+    # And it must end up in the judge prompt, not "(no brief available)".
+    prompt = classifier._build_prompt("buyer paid, deal closed", loaded)
+    assert "Buyer confirmed and payment received" in prompt
+    assert "(no brief available)" not in prompt
+
+
+def test_no_nested_path_under_any_resolution(real_taskpilot_dir):
+    """Belt-and-suspenders: the nested ~/.taskpilot/<id>/.taskpilot/ pattern
+    must not appear in any of the resolved paths. That was the bug shape.
+
+    Covers every module that resolves a taskpilot path while executing inside
+    the sandbox. `classifier` was missing from this list, which is exactly how
+    the brief-load leak shipped — keep all sandbox-executed modules here."""
+    real_tp, sandbox = real_taskpilot_dir
+    sys.path.insert(0, str(HOOKS_DIR.parent))
+    for mod in ("_record", "store", "actions", "classifier"):
+        if mod in sys.modules:
+            del sys.modules[mod]
+    import _record, store, actions, classifier
 
     sd = _record.state_dir("any-id")
-    paths = [str(sd), str(store.DEFAULT_DB_PATH), str(actions.TASKPILOT_DIR)]
+    paths = [
+        str(sd),
+        str(store.DEFAULT_DB_PATH),
+        str(actions.TASKPILOT_DIR),
+        str(classifier._TASKPILOT_DIR),
+    ]
     for p in paths:
         # The buggy form would have ".taskpilot/<id>/.taskpilot/" somewhere.
         assert "/.taskpilot/" not in p.replace(str(real_tp), "REAL").replace(str(sandbox), "SANDBOX"), \

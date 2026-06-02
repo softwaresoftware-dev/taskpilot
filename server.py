@@ -214,7 +214,7 @@ def spawn_task(task_id: str) -> dict:
 
     if not success:
         conn.close()
-        return {"error": "spawn failed: tmux launched but channel never registered with session-bridge within 20s"}
+        return {"error": "spawn failed: tmux session could not be launched"}
 
     store.update_status(conn, task_id, "running")
     store.increment_invocation(conn, task_id)
@@ -222,12 +222,14 @@ def spawn_task(task_id: str) -> dict:
 
     spawner.send_initial_prompt(task_id, task["description"])
 
+    # The channel may still be converging (eventually-consistent via the
+    # channel.mjs heartbeat) — report its real state rather than assuming True.
     return {
         "status": "running",
         "task_id": task_id,
         "kind": kind,
         "tmux_session": spawner.tmux_session_name(task_id),
-        "channel_healthy": True,
+        "channel_healthy": spawner.channel_healthy(task_id),
     }
 
 

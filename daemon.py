@@ -35,8 +35,30 @@ import store
 DEFAULT_PORT = 8912
 TASKPILOT_DIR = Path.home() / ".taskpilot"
 RECONCILE_INTERVAL_S = int(os.environ.get("TASKPILOT_RECONCILE_INTERVAL_S", "60"))
+# Idle TTL: a running agent with no activity (no turn / inbound message) for this
+# long is brought DOWN to a 'dormant' state — process recycled, identity intact,
+# reachable, wakes (resumes) on the next message. 0 disables (stay warm).
+# DEFAULT 0 (off) for now: waking a dormant agent depends on the session-bridge
+# channel re-registering on `claude --resume`, which is not yet reliable. The
+# completion-kill removal below is unconditional and is the real fix; turn
+# dormancy on (set TASKPILOT_IDLE_TTL_S>0) once channel-on-resume is solid.
+IDLE_TTL_S = int(os.environ.get("TASKPILOT_IDLE_TTL_S", "0"))
 
 log = logging.getLogger("taskpilot.daemon")
+
+
+def _idle_seconds(last_seen_at: str | None) -> float | None:
+    """Seconds since last activity, or None if unknown (never stamped)."""
+    if not last_seen_at:
+        return None
+    from datetime import datetime, timezone
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            ts = datetime.strptime(last_seen_at, fmt).replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - ts).total_seconds()
+        except ValueError:
+            continue
+    return None
 
 
 # --- Models ---
@@ -69,8 +91,11 @@ class MessageRequest(BaseModel):
 # filter is status='running' only.
 
 
-def _spawn_body(task: dict) -> None:
+def _spawn_body(task: dict, resume_session_id: str | None = None) -> None:
     """Synchronous spawn for one task. Used by /spawn endpoint and reconciler.
+
+    resume_session_id: when set, the agent is launched with `claude --resume
+    <id>` so it wakes back into its prior conversation (the wake path).
 
     Raises spawner.ChannelResolutionError on bad channels, RuntimeError on
     spawn failures (callers convert to HTTP errors or log).
@@ -87,10 +112,11 @@ def _spawn_body(task: dict) -> None:
     success = spawner.spawn_tmux(
         task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind,
         enabled_plugins=enabled_plugins, enabled_mcps=enabled_mcps,
+        resume_session_id=resume_session_id,
     )
     if not success:
         raise RuntimeError(
-            f"spawn failed for {task_id}: tmux launched but channel never registered"
+            f"spawn failed for {task_id}: tmux session could not be launched"
         )
 
 
@@ -100,7 +126,7 @@ def reconcile_once() -> dict:
     Read DB, check tmux for each running task, take action, write DB back.
     Synchronous so we can run it via asyncio.to_thread from the loop.
     """
-    counts = {"checked": 0, "alive": 0, "respawned": 0, "crashed": 0, "failed": 0}
+    counts = {"checked": 0, "alive": 0, "respawned": 0, "crashed": 0, "failed": 0, "dormant": 0}
     conn = store.get_db()
     try:
         running = store.list_tasks(conn, "running")
@@ -115,8 +141,27 @@ def reconcile_once() -> dict:
         counts["checked"] += 1
 
         if spawner.is_tmux_alive(task_id):
-            store.mark_seen(conn, task_id)
-            counts["alive"] += 1
+            # Capture the session id once the agent has produced a transcript,
+            # so we can resume it on wake. (Does NOT stamp last_seen — that's
+            # activity, set by the agent's hooks, and is what idle is measured
+            # from. Stamping it here on mere liveness would make nothing ever
+            # look idle.)
+            if not task.get("session_id"):
+                sid = spawner.capture_session_id(task_id)
+                if sid:
+                    store.set_session_id(conn, task_id, sid)
+            # Idle TTL: recycle a long-idle agent into 'dormant' (process down,
+            # identity intact, wakes on next message). Never 'completed' — idle
+            # is not done.
+            idle = _idle_seconds(task.get("last_seen_at"))
+            if IDLE_TTL_S and idle is not None and idle > IDLE_TTL_S:
+                log.info("reconcile: %s idle %.0fs > %ds — going dormant",
+                         task_id, idle, IDLE_TTL_S)
+                spawner.kill_tmux(task_id)
+                store.update_status(conn, task_id, "dormant")
+                counts["dormant"] += 1
+            else:
+                counts["alive"] += 1
             continue
 
         # tmux died. Service-kind: try to bring it back. Task-kind: mark crashed.
@@ -312,6 +357,7 @@ def spawn(task_id: str) -> dict:
 
     store.update_status(conn, task_id, "running")
     store.increment_invocation(conn, task_id)
+    store.mark_seen(conn, task_id)  # baseline activity stamp for the idle clock
     conn.close()
 
     spawner.send_initial_prompt(task_id, task["description"])
@@ -349,18 +395,49 @@ def kill(task_id: str) -> dict:
 
 @app.post("/tasks/{task_id}/message")
 def message(task_id: str, body: MessageRequest) -> dict:
-    """Forward a message to a task via session-bridge. Works for any kind."""
+    """Forward a message to a task via session-bridge, waking it if dormant.
+
+    A dormant agent (process recycled after idle, identity intact) is woken by
+    contacting it: we respawn it resumed into its prior conversation, wait for
+    its channel to register, then deliver. The message is the alarm clock."""
     conn = store.get_db()
     task = store.get_task(conn, task_id)
-    conn.close()
     if not task:
+        conn.close()
         raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
 
+    woke = False
     if not spawner.channel_healthy(task_id):
-        raise HTTPException(
-            status_code=502,
-            detail=f"task '{task_id}' channel not reachable via session-bridge",
-        )
+        # Only a DORMANT agent (idle-recycled, identity intact) is woken on
+        # contact. Any other unreachable state (pending/crashed/running-flaky)
+        # keeps the old 502 — spawn or let the reconciler recover it.
+        if task.get("status") == "dormant":
+            sid = task.get("session_id")
+            log.info("wake: %s dormant — respawning%s", task_id,
+                     f" --resume {sid}" if sid else " (no session id; cold)")
+            try:
+                _spawn_body(task, resume_session_id=sid)
+            except Exception as e:
+                conn.close()
+                raise HTTPException(status_code=502, detail=f"wake failed: {e}")
+            store.update_status(conn, task_id, "running")
+            store.increment_invocation(conn, task_id)
+            store.mark_seen(conn, task_id)
+            woke = True
+            conn.close()
+            # A resumed (--resume) cold start is slower than a fresh spawn: the
+            # agent replays its transcript before the channel re-registers
+            # (observed ~45-60s+). Give it a generous window.
+            if not spawner.wait_for_channel(task_id, timeout=int(os.environ.get("TASKPILOT_WAKE_TIMEOUT_S", "120"))):
+                raise HTTPException(status_code=504, detail=f"task '{task_id}' woke but channel did not register")
+        else:
+            conn.close()
+            raise HTTPException(
+                status_code=502,
+                detail=f"task '{task_id}' channel not reachable via session-bridge",
+            )
+    else:
+        conn.close()
 
     payload = json.dumps({
         "text": body.text,
@@ -377,7 +454,7 @@ def message(task_id: str, body: MessageRequest) -> dict:
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="timeout sending message")
 
-    return {"delivered": result.returncode == 0, "response": result.stdout}
+    return {"delivered": result.returncode == 0, "woke": woke, "response": result.stdout}
 
 
 # --- Entry point ---
