@@ -29,11 +29,9 @@ import subprocess
 from pathlib import Path
 
 _VALID_BUCKETS = ("resolved", "question", "uneventful")
-# Honor $TASKPILOT_HOME (set by the spawner) so the brief loads from the real
-# ~/.taskpilot/<id>/ — not the nested ~/.taskpilot/<id>/.taskpilot/<id>/ that
-# `Path.home() / .taskpilot` resolves to inside the sandbox. Mirrors actions.py
-# and hooks/_record.py; without it the judge runs blind to success_criteria.
-_TASKPILOT_DIR = Path(os.environ["TASKPILOT_HOME"]) if os.environ.get("TASKPILOT_HOME") else Path.home() / ".taskpilot"
+# Spawned agents run with the user's real $HOME, so ~/.taskpilot/ is the same
+# directory the daemon reads.
+_TASKPILOT_DIR = Path.home() / ".taskpilot"
 _JUDGE_TIMEOUT_S = 60
 _JUDGE_MODEL = "haiku"
 _STRIPPED_ENV_VARS = ("ANTHROPIC_API_KEY", "TASKPILOT_TASK_ID")

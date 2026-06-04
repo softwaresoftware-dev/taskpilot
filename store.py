@@ -1,21 +1,11 @@
 """SQLite storage layer for taskpilot."""
 
 import json
-import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Honor $TASKPILOT_HOME so hook scripts running inside a sandboxed agent
-# hit the daemon's real DB at ~/.taskpilot/taskpilot.db rather than a
-# per-task copy under the sandbox HOME. Without this override,
-# `mark_completed_and_kill` writes "completed" to a DB the daemon never
-# reads → status stuck at "running" + stale tmux.
-DEFAULT_DB_PATH = (
-    Path(os.environ["TASKPILOT_HOME"]) / "taskpilot.db"
-    if os.environ.get("TASKPILOT_HOME")
-    else Path.home() / ".taskpilot" / "taskpilot.db"
-)
+DEFAULT_DB_PATH = Path.home() / ".taskpilot" / "taskpilot.db"
 PORT_RANGE_START = 9100
 
 
@@ -104,24 +94,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN last_error TEXT DEFAULT NULL")
         conn.commit()
 
-    # Migrate: enabled_plugins — marketplace plugin keys to enable in the
-    # task's sandbox (separate from `plugins`, which is dev-mode --plugin-dir
-    # paths). Empty list = only the forced session-bridge/taskpilot defaults.
-    try:
-        conn.execute("SELECT enabled_plugins FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN enabled_plugins TEXT DEFAULT '[]'")
-        conn.commit()
-
-    # Migrate: enabled_mcps — names of MCP servers to inject into the task's
-    # sandbox .claude.json, resolved from the user's real ~/.claude.json.
-    # Empty list = no MCP servers (the sandbox strips the user's global ones).
-    try:
-        conn.execute("SELECT enabled_mcps FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN enabled_mcps TEXT DEFAULT '[]'")
-        conn.commit()
-
     # Migrate: session_id — the Claude session UUID, captured once the agent
     # has run a turn. Lets a dormant agent be resumed into the same conversation
     # on wake (claude --resume <id>).
@@ -153,17 +125,14 @@ def create_task(
     channels: list[str] | None = None,
     kind: str = "task",
     host: str | None = None,
-    enabled_plugins: list[str] | None = None,
-    enabled_mcps: list[str] | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind, host, enabled_plugins, enabled_mcps)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind, host)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
          json.dumps(plugins or []), json.dumps(operating_brief or {}), model,
-         cwd, json.dumps(channels or []), kind, host,
-         json.dumps(enabled_plugins or []), json.dumps(enabled_mcps or [])),
+         cwd, json.dumps(channels or []), kind, host),
     )
     conn.commit()
     return get_task(conn, task_id)

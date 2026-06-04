@@ -106,12 +106,8 @@ def _spawn_body(task: dict, resume_session_id: str | None = None) -> None:
     cwd = task.get("cwd")
     channels = json.loads(task["channels"]) if task.get("channels") else []
     kind = task.get("kind", "task")
-    enabled_plugins = json.loads(task["enabled_plugins"]) if task.get("enabled_plugins") else []
-    enabled_mcps = json.loads(task["enabled_mcps"]) if task.get("enabled_mcps") else []
-
     success = spawner.spawn_tmux(
         task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind,
-        enabled_plugins=enabled_plugins, enabled_mcps=enabled_mcps,
         resume_session_id=resume_session_id,
     )
     if not success:
@@ -147,7 +143,7 @@ def reconcile_once() -> dict:
             # from. Stamping it here on mere liveness would make nothing ever
             # look idle.)
             if not task.get("session_id"):
-                sid = spawner.capture_session_id(task_id)
+                sid = spawner.capture_session_id(task_id, cwd=task.get("cwd"))
                 if sid:
                     store.set_session_id(conn, task_id, sid)
             # Idle TTL: recycle a long-idle agent into 'dormant' (process down,

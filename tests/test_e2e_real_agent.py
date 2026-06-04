@@ -1,27 +1,13 @@
 """L3 end-to-end integration test — spawns a REAL claude agent.
 
-This is the only test layer that exercises the actual sandbox *runtime*: a real
-`claude` process in a real tmux session under a redirected HOME, real Claude
-Code hook dispatch, real session-bridge channel delivery, and the real
-classifier judge. Unit tests run in an environment where `Path.home()` is the
-developer's real home, so they are structurally blind to sandbox-context bugs.
-This test runs the real thing and asserts on real on-disk artifacts.
+This is the only test layer that exercises the actual runtime: a real `claude`
+process in a real tmux session, real Claude Code hook dispatch, real
+session-bridge channel delivery, and the real classifier judge. It runs the
+real thing and asserts on real on-disk artifacts.
 
 What it catches (deterministically, in the real runtime):
-  * the WRITE-leak class — any sandbox-executed module that resolves a path via
-    `Path.home()` instead of `$TASKPILOT_HOME` and then writes/mkdirs will
-    create a nested `~/.taskpilot/<id>/.taskpilot/` dir; we assert that never
-    appears anywhere under the sandbox HOME. This is module-agnostic — it does
-    not enumerate modules, so a NEW leaking module is caught automatically.
   * wiring breakage — hooks not firing, wrong event shape, channel not
     delivering, completion not tearing down tmux.
-
-Known blind spot (be honest): a *read*-only leak (e.g. the classifier loading
-brief.json from the wrong path) writes nothing, so the filesystem invariant
-can't see it, and a real model resolves a "done" message as complete with or
-without the brief. Read-leaks are pinned by the static AST guard (L1) and the
-deterministic judge-prompt-capture test (L2), not here. See
-docs / test_taskpilot_home_env.py.
 
 Gating — opt-in; uses tokens, network, OAuth, and ~30-90s wall clock:
   - TASKPILOT_E2E=1 must be set
@@ -170,23 +156,12 @@ def test_real_agent_runtime_artifacts_and_completion(real_agent):
     status, body = _post(f"{DAEMON_URL}/tasks/{tid}/spawn", {}, timeout=30)
     assert status == 200, f"spawn failed: {status} {body}"
 
-    # 1) Hooks fire AND write to the REAL path (not the sandbox-nested path).
-    #    Catches a _record/_state-dir Path.home() leak directly.
+    # 1) Hooks fire AND write to ~/.taskpilot/<id>/state/agent.json.
     assert _wait(lambda: agent_json.exists(), timeout=120), (
-        f"agent.json never appeared at the real path {agent_json} — hooks either "
-        f"didn't fire or wrote to a sandbox-nested path"
+        f"agent.json never appeared at {agent_json} — hooks didn't fire"
     )
 
-    # 2) WRITE-leak invariant (module-agnostic): no nested ~/.taskpilot/<id>/.taskpilot/
-    #    anywhere under the sandbox HOME. Any sandbox-executed module that wrote
-    #    via Path.home() would create this. This is the durable class-catcher.
-    nested = task_dir / ".taskpilot"
-    assert not nested.exists(), (
-        f"sandbox write-leak detected: a hook wrote to a Path.home()-derived "
-        f"nested dir {nested} instead of $TASKPILOT_HOME"
-    )
-
-    # 3) Stop hook captured the assistant's final message — proves Claude Code
+    # 2) Stop hook captured the assistant's final message — proves Claude Code
     #    fires the hook with the event shape on-stop.py expects.
     def stop_recorded() -> bool:
         try:
@@ -199,7 +174,7 @@ def test_real_agent_runtime_artifacts_and_completion(real_agent):
         "Stop hook never recorded last_assistant_message in agent.json"
     )
 
-    # 4) Full classify→act pipeline: the agent finishing → classifier → resolved
+    # 3) Full classify→act pipeline: the agent finishing → classifier → resolved
     #    → mark_completed_and_kill flips DB status and tears down tmux.
     def completed() -> bool:
         rec = _get_json(f"{DAEMON_URL}/tasks/{tid}")
@@ -209,7 +184,7 @@ def test_real_agent_runtime_artifacts_and_completion(real_agent):
         "task never reached 'completed' — classify→act completion pipeline broke"
     )
 
-    # 5) tmux session is actually gone after completion.
+    # 4) tmux session is actually gone after completion.
     alive = (
         subprocess.run(
             ["tmux", "has-session", "-t", spawner.tmux_session_name(tid)],

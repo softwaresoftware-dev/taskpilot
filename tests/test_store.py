@@ -101,23 +101,6 @@ class TestCreateTask:
         task = store.create_task(db, "t5", "T5", "desc")
         assert task["model"] is None
 
-    def test_create_with_enabled_plugins(self, db):
-        task = store.create_task(db, "t6", "T6", "desc",
-                                 enabled_plugins=["liteframe@softwaresoftware-plugins"])
-        assert json.loads(task["enabled_plugins"]) == ["liteframe@softwaresoftware-plugins"]
-
-    def test_create_without_enabled_plugins_defaults_empty(self, db):
-        task = store.create_task(db, "t7", "T7", "desc")
-        assert json.loads(task["enabled_plugins"]) == []
-
-    def test_create_with_enabled_mcps(self, db):
-        task = store.create_task(db, "t8", "T8", "desc",
-                                 enabled_mcps=["gmail-organizer", "slack"])
-        assert json.loads(task["enabled_mcps"]) == ["gmail-organizer", "slack"]
-
-    def test_create_without_enabled_mcps_defaults_empty(self, db):
-        task = store.create_task(db, "t9", "T9", "desc")
-        assert json.loads(task["enabled_mcps"]) == []
 
     def test_port_allocation_sequential(self, db):
         t1 = store.create_task(db, "a", "A", "desc")

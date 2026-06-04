@@ -137,7 +137,6 @@ class TestSpawnTmuxChannelPatience:
 
     def _patch_internals(self, monkeypatch):
         monkeypatch.setattr(spawner, "write_hook_settings", lambda tid: "/tmp/hs.json")
-        monkeypatch.setattr(spawner, "prepare_sandbox", lambda *a, **k: "/tmp/home")
         monkeypatch.setattr(spawner, "validate_channels", lambda chans: None)
         monkeypatch.setattr(spawner, "_setup_pane_log_capture", lambda *a, **k: None)
         monkeypatch.setattr(spawner.time, "sleep", lambda *a, **k: None)

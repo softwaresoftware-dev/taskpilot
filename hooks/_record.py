@@ -19,21 +19,8 @@ def task_id() -> str | None:
 
 
 def taskpilot_dir() -> Path:
-    """Resolve the real ~/.taskpilot/ — NOT the sandboxed HOME's ~/.taskpilot/.
-
-    The spawner exports $TASKPILOT_HOME pointing at the host's real
-    `~/.taskpilot/` before overriding HOME to the sandbox dir. Without this
-    env var, `Path.home() / .taskpilot` resolves to
-    `~/.taskpilot/<task_id>/.taskpilot/` inside the agent — nested, wrong,
-    invisible to the daemon. With the env var, the hooks and daemon read
-    the same directory.
-
-    Falls back to `Path.home() / .taskpilot` for direct invocations
-    (tests, scripts) where the env var isn't set.
-    """
-    override = os.environ.get("TASKPILOT_HOME")
-    if override:
-        return Path(override)
+    """Resolve ~/.taskpilot/. Spawned agents run with the user's real $HOME, so
+    this is the same directory the daemon reads."""
     return Path.home() / ".taskpilot"
 
 
