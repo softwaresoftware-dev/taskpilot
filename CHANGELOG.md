@@ -2,6 +2,18 @@
 
 All notable changes to taskpilot.
 
+## 0.12.0 — 2026-06-04
+
+### Removed
+
+- **Sandboxed `$HOME` for spawned agents (and the per-task curation it enabled).** Agents no longer run under a redirected `HOME` with a curated `~/.claude`. Each spawned agent now inherits the user's real `~/.claude` environment — global `CLAUDE.md`, rules, every installed plugin's skills, and every registered MCP server. Dropped: `prepare_sandbox`/`sandbox_home`/`_user_login_path` in `spawner.py`, the `HOME`/`PATH`/`TASKPILOT_HOME` env exports, and the `TASKPILOT_HOME` fallbacks in `store.py`, `actions.py`, `classifier.py`, and `hooks/_record.py`.
+- **`enabled_plugins` and `enabled_mcps` (breaking).** These per-task curation parameters were implemented entirely through the sandbox, so they are removed from `create_task` (MCP tool + `store.create_task`), the `--enabled-plugins`/`--enabled-mcps` CLI flags, and the `tasks` table columns. A spawned agent gets whatever plugins/MCPs the user has enabled globally.
+
+### Changed
+
+- `capture_session_id(task_id, cwd=None)` now reads transcripts from the real `~/.claude/projects/<encoded-cwd>/` (cwd with non-alphanumerics replaced by `-`) instead of the sandbox home.
+- The dispatcher provider's `spawn_helper.py` no longer passes `--enabled-plugins`/`--enabled-mcps` to the taskpilot spawner.
+
 ## 0.10.0 — 2026-05-17
 
 ### Added

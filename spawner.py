@@ -444,158 +444,6 @@ def _session_labels(kind: str) -> str:
     return f"kind:{kind}"
 
 
-def sandbox_home(task_id: str) -> Path:
-    """Filesystem path used as $HOME for the spawned claude process.
-
-    This is the task directory itself — deliberately the same path the agent
-    runs in (its cwd). Claude Code discovers project `.claude/` config (skills,
-    rules, CLAUDE.md) by walking *up* the directory tree from cwd, stopping at
-    $HOME. If HOME is a subdirectory of cwd (or otherwise not an ancestor), the
-    walk climbs past the sandbox into the real `/home/<user>/.claude/` and
-    pulls the user's personal skills + rules back in. Keeping HOME == cwd ==
-    task_dir makes the walk terminate immediately inside the sandbox.
-    """
-    return task_dir(task_id)
-
-
-def prepare_sandbox(task_id: str, allowed_plugins: list[str] | None = None,
-                    enabled_mcps: list[str] | None = None) -> Path:
-    """Build a curated $HOME for the agent so it doesn't inherit the user's
-    daily-driver Claude environment (CLAUDE.md, rules, MCPs, plugin list).
-
-    $HOME is the task directory itself (see sandbox_home) so it equals the
-    agent's cwd — that keeps Claude's project-config directory walk from
-    escaping the sandbox.
-
-    Layout:
-      ~/.taskpilot/<task_id>/                <- $HOME and cwd
-        .claude/
-          plugins/                -> symlink to user's real plugins dir (so
-                                     the loader finds cache + marketplaces)
-          sessions/               -> symlink to user's (session-bridge scans it)
-          projects/               (transcripts land here, isolated per-agent)
-          settings.json           (curated enabledPlugins + carried-forward
-                                   pluginConfigs for the enabled plugins)
-          .credentials.json       -> symlink to user's (no re-login)
-        .claude.json              (account state; mcpServers = only the
-                                   `enabled_mcps` resolved from the user's)
-        CLAUDE.md                 (task context, written by write_task_config)
-
-    No CLAUDE.md/rules/ from the user's real $HOME are provisioned; the agent's
-    task-specific context comes from the CLAUDE.md write_task_config drops at
-    task_dir. Re-runs are idempotent: existing files/symlinks get rebuilt.
-
-    `enabled_mcps` is a list of MCP server names; each is resolved against the
-    user's real ~/.claude.json `mcpServers` and copied into the sandbox's. The
-    user's other MCP servers do not leak in — the sandbox starts with none.
-    """
-    home = sandbox_home(task_id)
-    claude_dir = home / ".claude"
-    home.mkdir(parents=True, exist_ok=True)
-    claude_dir.mkdir(exist_ok=True)
-    (claude_dir / "projects").mkdir(exist_ok=True)
-
-    # Sessions — Claude Code writes its session.json (with the session_id) here,
-    # and session-bridge daemon discovers sessions by scanning this dir from the
-    # user's real $HOME. If the sandbox keeps its own sessions dir, the bridge
-    # never sees the agent and registration fails. Sessions files are pid-keyed
-    # so collisions are impossible; sharing the real dir is safe.
-    real_sessions = Path.home() / ".claude" / "sessions"
-    sandbox_sessions = claude_dir / "sessions"
-    if sandbox_sessions.is_symlink() or sandbox_sessions.exists():
-        if sandbox_sessions.is_symlink():
-            sandbox_sessions.unlink()
-        elif sandbox_sessions.is_dir():
-            shutil.rmtree(sandbox_sessions)
-    real_sessions.mkdir(parents=True, exist_ok=True)
-    sandbox_sessions.symlink_to(real_sessions)
-
-    # Plugins — symlink the user's whole `plugins/` dir into the sandbox.
-    # The plugin loader has a tangle of files that reference each other
-    # (cache/, marketplaces/, installed_plugins.json, known_marketplaces.json,
-    # data/, config.json, blocklist.json, install-counts-cache.json …). Forking
-    # subsets is fragile; the simpler invariant is "all plugins are findable;
-    # we curate which ones run via enabledPlugins below."
-    real_plugins_dir = Path.home() / ".claude" / "plugins"
-    sandbox_plugins_dir = claude_dir / "plugins"
-    if sandbox_plugins_dir.is_symlink() or sandbox_plugins_dir.exists():
-        if sandbox_plugins_dir.is_symlink():
-            sandbox_plugins_dir.unlink()
-        elif sandbox_plugins_dir.is_dir():
-            shutil.rmtree(sandbox_plugins_dir)
-    if real_plugins_dir.exists():
-        sandbox_plugins_dir.symlink_to(real_plugins_dir)
-
-    # Curate which plugins actually load by setting enabledPlugins. Anything
-    # not in this list stays installed but inert — its skills don't get
-    # injected into the system prompt, its tools aren't exposed.
-    real_installed = _read_json(INSTALLED_PLUGINS_PATH) or {}
-    real_plugins = real_installed.get("plugins", {})
-    keep = set(allowed_plugins or [])
-    keep.add("session-bridge@softwaresoftware-plugins")  # always — required for the channel
-    keep.add("taskpilot@softwaresoftware-plugins")       # always — its hooks fire on Stop/Notification
-    enabled_plugins = {key: True for key in real_plugins.keys() if key in keep}
-
-    # Carry forward each enabled plugin's userConfig. The sandbox writes its
-    # own settings.json (it can't symlink the user's — enabledPlugins must be
-    # curated), but a plugin enabled here still needs its pluginConfigs entry
-    # or it comes up unconfigured (CLAUDE_PLUGIN_OPTION_* env vars never get
-    # injected). Sensitive values live in the OS keychain, not settings.json,
-    # and resolve fine since the agent runs as the same OS user. Marketplaces
-    # are carried wholesale so the enabled keys' "@<marketplace>" refs resolve.
-    real_settings = _read_json(Path.home() / ".claude" / "settings.json") or {}
-    real_plugin_configs = real_settings.get("pluginConfigs", {})
-    plugin_configs = {k: v for k, v in real_plugin_configs.items() if k in enabled_plugins}
-
-    settings_payload = {
-        "enabledPlugins": enabled_plugins,
-        "pluginConfigs": plugin_configs,
-        # Skip the bypass-permissions warning. claude writes this after the
-        # user clicks "Yes, I accept" once; pre-setting it here means new
-        # sandboxes don't sit at that dialog and we don't need to send a
-        # post-launch keypress to dismiss it.
-        "skipDangerousModePermissionPrompt": True,
-    }
-    if "extraKnownMarketplaces" in real_settings:
-        settings_payload["extraKnownMarketplaces"] = real_settings["extraKnownMarketplaces"]
-    (claude_dir / "settings.json").write_text(json.dumps(settings_payload, indent=2))
-
-    # OAuth credentials — symlink the user's so the agent doesn't get stuck
-    # at the login screen. We're not isolating auth, just config.
-    real_creds = Path.home() / ".claude" / ".credentials.json"
-    sandbox_creds = claude_dir / ".credentials.json"
-    if sandbox_creds.is_symlink() or sandbox_creds.exists():
-        sandbox_creds.unlink()
-    if real_creds.exists():
-        sandbox_creds.symlink_to(real_creds)
-
-    # .claude.json — Claude Code reads this for account/onboarding state
-    # (oauthAccount, hasCompletedOnboarding, autoPermissionsNotificationCount,
-    # feature flags, …) AND for `mcpServers` and `projects`. We want the
-    # account/onboarding bits (so the agent doesn't re-run login or stall on
-    # bypass-permissions warnings) but NOT the user's daily-driver MCP list
-    # or per-project history. Allowlisting account keys is brittle — Claude
-    # Code adds new ones every release. Block-list instead: copy everything,
-    # then strip the bits we want curated.
-    real_user = _read_json(CLAUDE_JSON) or {}
-    blocked = {"mcpServers", "projects"}
-    claude_json_payload = {k: v for k, v in real_user.items() if k not in blocked}
-
-    # MCP servers — the sandbox starts with none of the user's. A caller
-    # declares the servers a task needs via `enabled_mcps` (names); each is
-    # resolved against the user's real ~/.claude.json and its config copied
-    # in verbatim. The MCP runs as the agent's subprocess under the same OS
-    # user, so any paths/secrets in the config still resolve. Names with no
-    # match are skipped (symmetric with how enabledPlugins filters).
-    real_mcps = real_user.get("mcpServers") or {}
-    claude_json_payload["mcpServers"] = {
-        name: real_mcps[name] for name in (enabled_mcps or []) if name in real_mcps
-    }
-    (home / ".claude.json").write_text(json.dumps(claude_json_payload, indent=2))
-
-    return home
-
-
 def write_hook_settings(task_id: str) -> Path:
     """Write a per-task settings file that registers Stop, Notification, and
     UserPromptSubmit hooks.
@@ -624,90 +472,24 @@ def write_hook_settings(task_id: str) -> Path:
     return path
 
 
-def _user_login_path() -> str:
-    """Capture the user's full PATH by asking their login shell.
-
-    This reproduces what Claude Code's own shell-snapshot (and the desktop app)
-    do to resolve PATH. The sandbox redirects HOME, which blinds Claude Code's
-    snapshot — it reads the now-empty sandbox shell config — so a spawned agent
-    would otherwise see only the lean `bash -lc` PATH and miss tools configured
-    in the user's rc files (gcloud, conda, nvm-managed node, sf, etc.).
-
-    We run the user's *actual* login shell (zsh on macOS, bash on Linux/WSL)
-    as a login + interactive shell so it sources both profile and rc files,
-    then read PATH back. The shell is detected from the passwd entry (falling
-    back to $SHELL, then bash) rather than hardcoded, so this is correct across
-    OSes. Markers fence the value so any rc-file stdout chatter can't corrupt
-    it. Falls back to the current process PATH on any failure.
-
-    Security is intentionally not a concern: spawned agents run as the same OS
-    user with their permissions, so surfacing the user's full toolchain is the
-    goal. The sandbox is a curation mechanism (which plugins/MCPs/state a task
-    gets), not a containment boundary.
-    """
-    fallback = os.environ.get("PATH", "")
-    shell = ""
-    try:
-        import pwd
-
-        shell = pwd.getpwuid(os.getuid()).pw_shell or ""
-    except Exception:  # noqa: BLE001
-        pass
-    if not shell or not Path(shell).exists():
-        shell = os.environ.get("SHELL", "") or shutil.which("bash") or "/bin/sh"
-    sentinel = "__TPPATH__"
-    try:
-        result = subprocess.run(
-            [shell, "-ilc", f'printf "{sentinel}%s{sentinel}" "$PATH"'],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            stdin=subprocess.DEVNULL,
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("login-shell PATH capture failed (%s); using process PATH", e)
-        return fallback
-    out = result.stdout or ""
-    start = out.find(sentinel)
-    end = out.rfind(sentinel)
-    if start == -1 or end <= start:
-        log.warning("login-shell PATH capture returned no marker; using process PATH")
-        return fallback
-    captured = out[start + len(sentinel):end]
-    return captured or fallback
-
-
 def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
                cwd: str | None = None, channels: list[str] | None = None,
-               kind: str = "task", enabled_plugins: list[str] | None = None,
-               enabled_mcps: list[str] | None = None,
+               kind: str = "task",
                resume_session_id: str | None = None) -> bool:
     """Launch the Claude session in tmux. Messaging goes through session-bridge.
+
+    The agent inherits the user's real ~/.claude environment (global CLAUDE.md,
+    rules, installed plugins, registered MCP servers).
 
     resume_session_id: when set, launch with `claude --resume <id>` so the agent
     wakes back into its existing conversation (used to wake a dormant agent)."""
     session = tmux_session_name(task_id)
-    # Default cwd is the task dir, which is also the sandbox $HOME — keeping
-    # cwd == $HOME stops Claude's project-config walk from escaping the
-    # sandbox. An explicit cwd (a real project) opts out of that guarantee:
-    # the walk will climb to the real ~/.claude above that project.
+    # Default cwd is the task dir; an explicit cwd points the agent at a real
+    # project instead.
     td = cwd or str(task_dir(task_id))
 
     # Per-task hooks (Stop, Notification) → ~/.taskpilot/<id>/state/agent.json
     hook_settings = write_hook_settings(task_id)
-
-    # Build a curated $HOME so the agent doesn't inherit the user's daily-driver
-    # ~/.claude environment (global CLAUDE.md, rules, personal skills, every
-    # installed plugin's skills, every registered MCP). Without this, beats-dj
-    # loaded ~30k+ tokens of irrelevant context (phone bridge instructions,
-    # contact list, etc.) at every restart.
-    # `plugins` is a list of filesystem paths passed to --plugin-dir (dev-mode
-    # loads). `enabled_plugins` is installed-plugin marketplace keys curated
-    # into the sandbox's enabledPlugins. The two are independent: --plugin-dir
-    # plugins load regardless of enabledPlugins. `enabled_mcps` names MCP
-    # servers to copy from the user's ~/.claude.json into the sandbox's.
-    home = prepare_sandbox(task_id, allowed_plugins=enabled_plugins or [],
-                           enabled_mcps=enabled_mcps or [])
 
     # Build plugin-dir flags
     plugin_flags = ""
@@ -745,34 +527,14 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     #
     # Env exports:
     #   TASKPILOT_TASK_ID — for capability plugins that scope storage per task
-    #   TASKPILOT_HOME    — the REAL ~/.taskpilot/ on the host, so hook scripts
-    #                       inside the sandbox can find the daemon's DB and
-    #                       write state to a path the daemon reads. Without
-    #                       this, `Path.home() / .taskpilot` inside the sandbox
-    #                       resolves to ~/.taskpilot/<id>/.taskpilot/ — nested,
-    #                       invisible to the daemon, breaking auto-completion.
     #   SESSION_NAME      — read by session-bridge channel.mjs at /register
     #   SESSION_NAMESPACE — same
     #   SESSION_LABELS    — same
     #   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false — no human is at the keyboard
     #     in a spawned agent, so the forked-suggestion LLM call is pure waste.
-    #   PATH — captured from the user's login shell (see _user_login_path).
-    #     The sandbox redirects HOME, which blinds Claude Code's own
-    #     shell-snapshot PATH capture (it reads the empty sandbox config), so
-    #     the agent would otherwise miss tools configured in the user's rc files
-    #     (gcloud, conda, nvm-managed node, etc.). We reproduce that capture and
-    #     inject the result, keeping $PATH as a fallback. The sandbox is a
-    #     curation mechanism, not a security boundary — agents run as the same
-    #     user with their permissions by design — so surfacing the full
-    #     toolchain is intended.
-    real_taskpilot_dir = str(Path.home() / ".taskpilot")
-    agent_path = _user_login_path()
     # Wake path: resume the agent's existing conversation instead of cold-starting.
     resume_flag = f" --resume {resume_session_id}" if resume_session_id else ""
-    cmd = f"""export HOME={home}
-export PATH="{agent_path}:$PATH"
-export TASKPILOT_TASK_ID={task_id}
-export TASKPILOT_HOME={real_taskpilot_dir}
+    cmd = f"""export TASKPILOT_TASK_ID={task_id}
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export SESSION_LABELS={labels}
@@ -797,8 +559,9 @@ cd {td} && claude --dangerously-skip-permissions{resume_flag} \\
     _setup_pane_log_capture(task_id, session)
 
     # Auto-accept trust dialog (option 1, "Yes, I trust this folder", is default).
-    # The bypass-permissions warning is skipped via the settings.json flag set
-    # in prepare_sandbox, so the next thing claude shows is the channels warning.
+    # The bypass-permissions warning is a one-time per-user prompt the user has
+    # already accepted on their real ~/.claude, so the next thing claude shows is
+    # the channels warning.
     time.sleep(7)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
 
@@ -864,14 +627,22 @@ def is_tmux_alive(task_id: str) -> bool:
     return result.returncode == 0
 
 
-def capture_session_id(task_id: str) -> str | None:
+def capture_session_id(task_id: str, cwd: str | None = None) -> str | None:
     """The Claude session UUID for this agent, read from its newest transcript
-    file (<sandbox HOME>/.claude/projects/<hash>/<session_id>.jsonl). Returns
-    None until the agent has run at least one turn. Used to resume on wake."""
-    proj = sandbox_home(task_id) / ".claude" / "projects"
+    file. Returns None until the agent has run at least one turn. Used to resume
+    on wake.
+
+    Claude Code stores transcripts under ~/.claude/projects/<encoded-cwd>/, where
+    the project dir name is the agent's cwd with every non-alphanumeric character
+    replaced by '-' (e.g. /home/u/.taskpilot/x -> -home-u--taskpilot-x). The cwd
+    defaults to the task dir; an explicit cwd (a real project) is encoded the
+    same way."""
+    launch_cwd = cwd or str(task_dir(task_id))
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", launch_cwd)
+    proj = Path.home() / ".claude" / "projects" / encoded
     if not proj.exists():
         return None
-    files = sorted(proj.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0].stem if files else None
 
 
