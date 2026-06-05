@@ -43,24 +43,16 @@ def task_dir(task_id: str) -> Path:
 
 # --- pane.log persistent log capture (v0.8.0) ---------------------------------
 # Tmux pane buffers are ephemeral: they die with the session. We tee pane output
-# to ~/.taskpilot/<task_id>/pane.log via `tmux pipe-pane` so completion-path
-# `get_task_log` and downstream consumers (taskboard) can read agent history
-# after the task is gone. Sentinel file pane.log.attached marks successful
-# attach this invocation; mark_completed_and_kill keys on it to choose between
-# steady (toggle-off) and legacy (capture-pane) flush paths.
+# to ~/.taskpilot/<task_id>/pane.log via `tmux pipe-pane` so `get_task_log` and
+# downstream consumers (taskboard) can read agent history after the task is gone.
 
 PANE_LOG_NAME = "pane.log"
-PANE_LOG_SENTINEL_NAME = "pane.log.attached"
 PANE_LOG_MAX_BYTES_DEFAULT = 10 * 1024 * 1024
 PANE_LOG_MIN_BYTES = 4096
 
 
 def pane_log_path(task_id: str) -> Path:
     return task_dir(task_id) / PANE_LOG_NAME
-
-
-def pane_log_sentinel(task_id: str) -> Path:
-    return task_dir(task_id) / PANE_LOG_SENTINEL_NAME
 
 
 def _pane_log_max_bytes() -> int:
@@ -168,13 +160,13 @@ def _install_pipe_pane(session: str, path: Path) -> bool:
 
 
 def _setup_pane_log_capture(task_id: str, session: str) -> None:
-    """Wire pipe-pane tee + sentinel for this invocation.
+    """Wire the pipe-pane tee for this invocation.
 
     Sequence: truncate (if oversized) → write invocation separator → attach
-    pipe-pane → manage sentinel based on attach result.
+    pipe-pane. All steps are best-effort: spawn must not depend on log
+    infrastructure.
     """
     path = pane_log_path(task_id)
-    sentinel = pane_log_sentinel(task_id)
     try:
         _truncate_if_oversize(path)
     except Exception as e:  # noqa: BLE001
@@ -183,28 +175,7 @@ def _setup_pane_log_capture(task_id: str, session: str) -> None:
         _write_invocation_separator(path, task_id)
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"taskpilot: separator write failed for {task_id}: {e}\n")
-    attached = _install_pipe_pane(session, path)
-    if attached:
-        # Create sentinel with mode 0600 (born at correct mode via os.open).
-        try:
-            fd = os.open(
-                str(sentinel),
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                0o600,
-            )
-            os.close(fd)
-        except OSError as e:
-            sys.stderr.write(f"taskpilot: sentinel write failed for {task_id}: {e}\n")
-    else:
-        # Carryover sentinel from a prior successful invocation must not survive
-        # a failed attach — completion path would otherwise take the steady
-        # branch and lose recoverable scrollback.
-        try:
-            sentinel.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            sys.stderr.write(f"taskpilot: sentinel unlink failed for {task_id}: {e}\n")
+    _install_pipe_pane(session, path)
 
 
 def write_task_config(

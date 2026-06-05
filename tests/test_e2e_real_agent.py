@@ -1,13 +1,13 @@
 """L3 end-to-end integration test — spawns a REAL claude agent.
 
 This is the only test layer that exercises the actual runtime: a real `claude`
-process in a real tmux session, real Claude Code hook dispatch, real
-session-bridge channel delivery, and the real classifier judge. It runs the
-real thing and asserts on real on-disk artifacts.
+process in a real tmux session, real Claude Code hook dispatch, and real
+session-bridge channel delivery. It runs the real thing and asserts on real
+on-disk artifacts.
 
 What it catches (deterministically, in the real runtime):
   * wiring breakage — hooks not firing, wrong event shape, channel not
-    delivering, completion not tearing down tmux.
+    delivering.
 
 Gating — opt-in; uses tokens, network, OAuth, and ~30-90s wall clock:
   - TASKPILOT_E2E=1 must be set
@@ -62,14 +62,6 @@ def _post(url: str, body: dict, timeout: float = 20.0) -> tuple[int, str]:
         return r.status, r.read().decode()
 
 
-def _get_json(url: str, timeout: float = 5.0) -> dict | None:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except Exception:
-        return None
-
-
 def _wait(pred, timeout: float, interval: float = 3.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -100,8 +92,8 @@ pytestmark = [
 def real_agent():
     """Create + spawn a real one-shot agent with a brief; always tear it down.
 
-    The brief carries success_criteria the classifier must load to judge the
-    finish; the description drives a fast, tool-free, deterministic reply.
+    The description drives a fast, tool-free, deterministic reply so the Stop
+    hook fires quickly.
     """
     tid = "e2e-" + uuid.uuid4().hex[:8]
     brief = {
@@ -145,7 +137,7 @@ def real_agent():
         pass
 
 
-def test_real_agent_runtime_artifacts_and_completion(real_agent):
+def test_real_agent_runtime_artifacts(real_agent):
     tid, _brief = real_agent
     real_taskpilot = Path(os.path.expanduser("~")) / ".taskpilot"
     task_dir = real_taskpilot / tid
@@ -173,23 +165,3 @@ def test_real_agent_runtime_artifacts_and_completion(real_agent):
     assert _wait(stop_recorded, timeout=60), (
         "Stop hook never recorded last_assistant_message in agent.json"
     )
-
-    # 3) Full classify→act pipeline: the agent finishing → classifier → resolved
-    #    → mark_completed_and_kill flips DB status and tears down tmux.
-    def completed() -> bool:
-        rec = _get_json(f"{DAEMON_URL}/tasks/{tid}")
-        return bool(rec and rec.get("status") == "completed")
-
-    assert _wait(completed, timeout=120), (
-        "task never reached 'completed' — classify→act completion pipeline broke"
-    )
-
-    # 4) tmux session is actually gone after completion.
-    alive = (
-        subprocess.run(
-            ["tmux", "has-session", "-t", spawner.tmux_session_name(tid)],
-            capture_output=True,
-        ).returncode
-        == 0
-    )
-    assert not alive, "tmux session still alive after task marked completed"

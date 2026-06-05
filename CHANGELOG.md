@@ -2,6 +2,32 @@
 
 All notable changes to taskpilot.
 
+## 0.12.1 — 2026-06-04
+
+### Removed
+
+- **The completion-classifier machinery (dead code).** The `4f12e15` lifecycle
+  change already stopped wiring the Stop hook to a prose-classifier that
+  inferred completion and killed the agent; this release deletes the now-orphaned
+  code: `classifier.py` (the `claude -p` Haiku judge), `actions.py`
+  (`mark_completed_and_kill` + `notify_human` + the pre-kill pane.log flush),
+  and their test suites (`test_classifier.py`, `test_actions.py`,
+  `test_actions_pane_log.py`).
+- **The pane.log `pane.log.attached` sentinel.** It existed only so the
+  completion flush could pick the steady-vs-legacy path. With that path gone the
+  sentinel had no reader, so `PANE_LOG_SENTINEL_NAME`, `pane_log_sentinel()`, and
+  the sentinel create/unlink in `_setup_pane_log_capture` are removed. Live
+  pane.log capture (pipe-pane tee, invocation separators, size cap) is unchanged
+  — killed/recycled tasks still get their scrollback via the live tee's EOF flush.
+
+### Changed
+
+- The real-agent e2e (`test_e2e_real_agent.py`) no longer asserts a `classify→act`
+  completion transition (that behavior no longer exists); it now verifies spawn,
+  hook dispatch, and Stop-hook recording only.
+- Docs (`CLAUDE.md`) updated: completion is never inferred from prose; idle agents
+  are recycled to `dormant` and wake on the next message.
+
 ## 0.12.0 — 2026-06-04
 
 ### Removed

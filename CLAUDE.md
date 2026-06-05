@@ -49,7 +49,7 @@ WSL setup gotchas for taskpilot specifically:
 5. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
 6. External callers (taskboard "msg" button, cron schedules) send messages the same way.
 7. The daemon's reconciler tick (every 60s) walks running tasks. If a service's tmux died, it respawns. If a task's tmux died, it marks crashed.
-8. Task completes when the agent writes `"phase": "done"` to state.json or its final assistant message matches the completion regex; the Stop hook flips status to `completed` and the reconciler ignores completed tasks.
+8. Completion is never inferred from the agent's prose. An idle agent is just recycled to `dormant` by the reconciler (process down, identity intact, wakes on the next message). If a task ever needs a terminal `completed` state, that must come from an explicit signal, not a guess.
 
 ## Supervisor Daemon
 
@@ -84,23 +84,13 @@ The reconciler interval is configurable via `TASKPILOT_RECONCILE_INTERVAL_S` (de
 
 Spawned agents run with three Claude Code hooks registered via `--settings`:
 
-- **`Stop`** → `hooks/on-stop.py` — fires when the assistant finishes a turn. Records `last_assistant_message`, timestamp, and session id to `state/agent.json`, then classifies and acts.
+- **`Stop`** → `hooks/on-stop.py` — fires when the assistant finishes a turn. Records `last_assistant_message`, timestamp, and session id to `state/agent.json`, and stamps `last_seen_at` so the idle clock resets. No classification, no completion-kill — the hook only records.
 - **`Notification`** → `hooks/on-notification.py` — fires when Claude has been idle at a prompt past ~6s. Records `notification_type` (`permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog`) plus message and title.
 - **`UserPromptSubmit`** → `hooks/on-prompt.py` — fires when an inbound prompt arrives (mesh message or user input). Records the prompt (truncated) so received-vs-replied can be paired against the matching Stop event.
 
 All three share `hooks/_record.py` for the read-modify-write of `agent.json` and the `events.jsonl` audit log. They no-op when `TASKPILOT_TASK_ID` is unset, which keeps them safe if the settings file is loaded outside a taskpilot context. Each hook also calls `mark_seen()` to stamp `tasks.last_seen_at = now`.
 
-### Stop hook classify + act
-
-`classifier.py` buckets the final assistant message:
-
-| Bucket | Trigger | Action (in `actions.py`) |
-|---|---|---|
-| `resolved` | message tail matches `COMPLETION_PATTERNS` | `mark_completed_and_kill` — flips DB to `completed`, detached `tmux kill-session` |
-| `question` | message tail ends in `?` | `notify_human` — appends to `escalations.jsonl`, shells out to `$TASKPILOT_NOTIFY_CMD` if set |
-| `uneventful` | neither | no-op; agent stays at the prompt |
-
-`$TASKPILOT_NOTIFY_CMD` is the user's plug point for whichever notification transport they want (Slack webhook, phone bridge, `notify-send`, etc.). The script gets `TASKPILOT_TASK_ID` and `TASKPILOT_MESSAGE` in env. Resolved bucket false-positives cause premature completion, so the regex is conservative; question bucket false-positives only cost a stray notification, so the rule is loose.
+The hooks are record-only. Earlier versions ran an LLM/regex classifier in the Stop hook that inferred completion from the agent's final message and killed the session; that was removed. Completion is no longer guessed from prose — idle agents are recycled to `dormant` by the reconciler and wake on the next message.
 
 ## Architecture
 

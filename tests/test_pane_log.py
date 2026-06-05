@@ -1,5 +1,5 @@
 """Tests for pane.log capture in spawner.py — pipe-pane install, separator
-writes, sentinel management, size cap.
+writes, size cap.
 """
 import os
 import subprocess
@@ -20,7 +20,6 @@ from spawner import (
     _truncate_if_oversize,
     _write_invocation_separator,
     pane_log_path,
-    pane_log_sentinel,
 )
 
 
@@ -202,37 +201,7 @@ def test_pane_log_max_bytes_garbage_returns_default(monkeypatch):
     assert _pane_log_max_bytes() == PANE_LOG_MAX_BYTES_DEFAULT
 
 
-# --- _setup_pane_log_capture (sentinel management) ---------------------------
-
-def test_setup_creates_sentinel_on_success(isolated_taskpilot_dir, fake_store):
-    task_id = "task-1"
-    (isolated_taskpilot_dir / task_id).mkdir()
-    with patch("spawner._install_pipe_pane", return_value=True):
-        _setup_pane_log_capture(task_id, "session-x")
-    sentinel = pane_log_sentinel(task_id)
-    assert sentinel.exists()
-    if os.name == "posix":
-        assert (sentinel.stat().st_mode & 0o777) == 0o600
-
-
-def test_setup_does_not_create_sentinel_on_failure(isolated_taskpilot_dir, fake_store):
-    task_id = "task-1"
-    (isolated_taskpilot_dir / task_id).mkdir()
-    with patch("spawner._install_pipe_pane", return_value=False):
-        _setup_pane_log_capture(task_id, "session-x")
-    assert not pane_log_sentinel(task_id).exists()
-
-
-def test_setup_unlinks_stale_sentinel_on_failure(isolated_taskpilot_dir, fake_store):
-    task_id = "task-1"
-    td = isolated_taskpilot_dir / task_id
-    td.mkdir()
-    # Pre-existing sentinel from a prior successful invocation
-    pane_log_sentinel(task_id).touch()
-    with patch("spawner._install_pipe_pane", return_value=False):
-        _setup_pane_log_capture(task_id, "session-x")
-    assert not pane_log_sentinel(task_id).exists()
-
+# --- _setup_pane_log_capture -------------------------------------------------
 
 def test_setup_writes_separator_even_when_pipe_fails(isolated_taskpilot_dir, fake_store):
     task_id = "task-1"
@@ -246,4 +215,3 @@ def test_setup_writes_separator_even_when_pipe_fails(isolated_taskpilot_dir, fak
 
 def test_setup_pane_log_path_helpers(isolated_taskpilot_dir):
     assert pane_log_path("foo") == isolated_taskpilot_dir / "foo" / "pane.log"
-    assert pane_log_sentinel("foo") == isolated_taskpilot_dir / "foo" / "pane.log.attached"
