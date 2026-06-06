@@ -1,23 +1,10 @@
 [project]
 name = "taskpilot"
-version = "0.12.1"
-description = "Spawn and manage long-running autonomous Claude Code sessions"
+version = "0.13.0"
+description = "A local service exposing an HTTP API to spawn and manage long-running autonomous Claude Code agents"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest",
-]
-
-[tool.pytest.ini_options]
-# e2e is opt-in: it spawns a real claude agent (tokens, auth, ~60s). The
-# default run excludes it; `make test-e2e` runs it with TASKPILOT_E2E=1.
-addopts = "-m 'not e2e'"
-markers = [
-    "e2e: real-claude end-to-end integration test (requires TASKPILOT_E2E=1, claude on PATH, daemon + session-bridge up)",
 ]

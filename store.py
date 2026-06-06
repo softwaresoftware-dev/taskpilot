@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from contextlib import contextmanager
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path.home() / ".taskpilot" / "taskpilot.db"
@@ -20,6 +20,20 @@ def get_db(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def db(db_path: str | None = None):
+    """Open a connection and guarantee it closes — even if the caller raises.
+
+        with store.db() as conn:
+            task = store.get_task(conn, task_id)
+    """
+    conn = get_db(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
@@ -32,76 +46,27 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             operating_brief TEXT DEFAULT '{}',
             invocation_count INTEGER DEFAULT 0,
             model TEXT DEFAULT NULL,
+            cwd TEXT DEFAULT NULL,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         )
     """)
     conn.commit()
 
-    # Migrate existing DBs that lack the operating_brief column
-    try:
-        conn.execute("SELECT operating_brief FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN operating_brief TEXT DEFAULT '{}'")
-        conn.commit()
-
-    # Migrate existing DBs that lack the model column
-    try:
-        conn.execute("SELECT model FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT DEFAULT NULL")
-        conn.commit()
-
-    # Migrate: cwd column (custom working directory)
-    try:
-        conn.execute("SELECT cwd FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN cwd TEXT DEFAULT NULL")
-        conn.commit()
-
-    # Migrate: channels column (additional dev channel servers)
-    try:
-        conn.execute("SELECT channels FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN channels TEXT DEFAULT '[]'")
-        conn.commit()
-
-    # Migrate: kind column (task or service)
-    try:
-        conn.execute("SELECT kind FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN kind TEXT DEFAULT 'task'")
-        conn.commit()
-
-    # Migrate: host column (which mesh host the task runs on; NULL = local)
-    try:
-        conn.execute("SELECT host FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN host TEXT DEFAULT NULL")
-        conn.commit()
-
-    # Migrate: last_seen_at — most recent liveness signal (heartbeat or hook fire).
-    try:
-        conn.execute("SELECT last_seen_at FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN last_seen_at TEXT DEFAULT NULL")
-        conn.commit()
-
-    # Migrate: last_error — short string describing the most recent failure.
-    try:
-        conn.execute("SELECT last_error FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN last_error TEXT DEFAULT NULL")
-        conn.commit()
-
-    # Migrate: session_id — the Claude session UUID, captured once the agent
-    # has run a turn. Lets a dormant agent be resumed into the same conversation
-    # on wake (claude --resume <id>).
-    try:
-        conn.execute("SELECT session_id FROM tasks LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tasks ADD COLUMN session_id TEXT DEFAULT NULL")
-        conn.commit()
+    # Lightweight migrations for DBs created by an earlier schema. Columns the
+    # pared-down build no longer uses (kind, host, channels, session_id,
+    # last_seen_at, last_error) are simply left in place if present — extra
+    # columns are harmless. We only ADD columns the current code reads.
+    for col, ddl in (
+        ("operating_brief", "ALTER TABLE tasks ADD COLUMN operating_brief TEXT DEFAULT '{}'"),
+        ("model", "ALTER TABLE tasks ADD COLUMN model TEXT DEFAULT NULL"),
+        ("cwd", "ALTER TABLE tasks ADD COLUMN cwd TEXT DEFAULT NULL"),
+    ):
+        try:
+            conn.execute(f"SELECT {col} FROM tasks LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(ddl)
+            conn.commit()
 
 
 def allocate_port(conn: sqlite3.Connection) -> int:
@@ -122,17 +87,13 @@ def create_task(
     operating_brief: dict | None = None,
     model: str | None = None,
     cwd: str | None = None,
-    channels: list[str] | None = None,
-    kind: str = "task",
-    host: str | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind, host)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
-         json.dumps(plugins or []), json.dumps(operating_brief or {}), model,
-         cwd, json.dumps(channels or []), kind, host),
+         json.dumps(plugins or []), json.dumps(operating_brief or {}), model, cwd),
     )
     conn.commit()
     return get_task(conn, task_id)
@@ -174,45 +135,3 @@ def increment_invocation(conn: sqlite3.Connection, task_id: str) -> None:
         (task_id,),
     )
     conn.commit()
-
-
-def mark_seen(conn: sqlite3.Connection, task_id: str) -> None:
-    """Stamp last_seen_at = now. last_seen_at means LAST ACTIVITY (a turn or an
-    inbound message), stamped by the agent's lifecycle hooks. The reconciler no
-    longer stamps it on mere tmux-aliveness, so idle can be measured from it."""
-    conn.execute(
-        "UPDATE tasks SET last_seen_at = datetime('now') WHERE task_id = ?",
-        (task_id,),
-    )
-    conn.commit()
-
-
-def set_session_id(conn: sqlite3.Connection, task_id: str, session_id: str) -> None:
-    """Record the Claude session UUID (once), so a dormant agent can be resumed
-    into the same conversation on wake. No-op if already set or sid is falsy."""
-    if not session_id:
-        return
-    conn.execute(
-        "UPDATE tasks SET session_id = ? WHERE task_id = ? "
-        "AND (session_id IS NULL OR session_id = '')",
-        (session_id, task_id),
-    )
-    conn.commit()
-
-
-def mark_crashed(conn: sqlite3.Connection, task_id: str, error: str) -> None:
-    """Flip status to 'crashed' and record why. Called when the liveness
-    reconciler finds a row marked 'running' but no live tmux session."""
-    conn.execute(
-        """UPDATE tasks SET status = 'crashed', last_error = ?, updated_at = datetime('now')
-           WHERE task_id = ?""",
-        (error, task_id),
-    )
-    conn.commit()
-
-
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Delete a task from the database. Returns True if a row was deleted."""
-    cursor = conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
-    conn.commit()
-    return cursor.rowcount > 0

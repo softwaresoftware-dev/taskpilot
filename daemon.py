@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """Taskpilot supervisor daemon.
 
-Long-lived process that owns the spawn/kill/respawn lifecycle for tasks.
-The MCP server (server.py) is a thin client over this daemon's HTTP API.
+A long-lived local service that owns the spawn/kill/message lifecycle for
+tasks and exposes it over an HTTP API on :8912. The MCP server (server.py)
+is a thin client over this daemon.
 
-The daemon installs as a single systemd user unit (`daemon.py --install`)
-and supervises every running task via a periodic reconciler that walks the
-task DB, checks tmux liveness, and respawns dead services or marks dead
-one-shots as crashed. Spawn / kill / message all flow through the same
-HTTP endpoints regardless of task kind — the kind difference is reconciler
-treatment, not spawn path.
+The daemon installs as a boot-persistence service (systemd user unit on
+Linux, launchd agent on macOS) via `daemon.py --install`. It is reactive:
+it acts on API calls, not on a background timer. Liveness (is the agent's
+tmux still alive) is reported on-demand when a task is listed or fetched.
 """
 
-import asyncio
 import json
 import logging
 import os
 import platform
 import subprocess
 import sys
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
@@ -29,36 +26,11 @@ from pydantic import BaseModel
 # We're a sibling of server.py / spawner.py / store.py
 sys.path.insert(0, str(Path(__file__).parent))
 import spawner
-import tail
 import store
 
 DEFAULT_PORT = 8912
-TASKPILOT_DIR = Path.home() / ".taskpilot"
-RECONCILE_INTERVAL_S = int(os.environ.get("TASKPILOT_RECONCILE_INTERVAL_S", "60"))
-# Idle TTL: a running agent with no activity (no turn / inbound message) for this
-# long is brought DOWN to a 'dormant' state — process recycled, identity intact,
-# reachable, wakes (resumes) on the next message. 0 disables (stay warm).
-# DEFAULT 0 (off) for now: waking a dormant agent depends on the session-bridge
-# channel re-registering on `claude --resume`, which is not yet reliable. The
-# completion-kill removal below is unconditional and is the real fix; turn
-# dormancy on (set TASKPILOT_IDLE_TTL_S>0) once channel-on-resume is solid.
-IDLE_TTL_S = int(os.environ.get("TASKPILOT_IDLE_TTL_S", "0"))
 
 log = logging.getLogger("taskpilot.daemon")
-
-
-def _idle_seconds(last_seen_at: str | None) -> float | None:
-    """Seconds since last activity, or None if unknown (never stamped)."""
-    if not last_seen_at:
-        return None
-    from datetime import datetime, timezone
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            ts = datetime.strptime(last_seen_at, fmt).replace(tzinfo=timezone.utc)
-            return (datetime.now(timezone.utc) - ts).total_seconds()
-        except ValueError:
-            continue
-    return None
 
 
 # --- Models ---
@@ -67,7 +39,7 @@ def _idle_seconds(last_seen_at: str | None) -> float | None:
 class HealthResponse(BaseModel):
     ok: bool
     version: str
-    supervised: int
+    running: int
     total: int
 
 
@@ -76,164 +48,33 @@ class MessageRequest(BaseModel):
     from_session: str | None = None
 
 
-# --- Reconciler ---
-#
-# Every RECONCILE_INTERVAL_S seconds the daemon walks tasks with
-# status='running' and reconciles DB ↔ reality:
-#   - tmux alive → stamp last_seen_at (heartbeat)
-#   - tmux dead, kind=service → respawn (the supervisor part)
-#   - tmux dead, kind=task    → mark crashed (one-shot semantics)
-#
-# This single tick covers boot-time spawn-up (first tick after the daemon
-# starts brings services back), crash recovery (next tick after tmux dies
-# reaps and respawns), and liveness reconciliation (DB status reflects
-# what's actually running). Killed and completed tasks are ignored — the
-# filter is status='running' only.
+class CreateSpawnRequest(BaseModel):
+    """One-shot create-and-spawn for event-driven callers (e.g. dispatcher)
+    that have no prior task row. Collapses the MCP define_task + spawn_task
+    pair into a single HTTP round-trip."""
+    description: str
+    name: str | None = None
+    cwd: str | None = None
+    model: str | None = None
+    brief: dict | None = None
 
 
-def _spawn_body(task: dict, resume_session_id: str | None = None) -> None:
-    """Synchronous spawn for one task. Used by /spawn endpoint and reconciler.
-
-    resume_session_id: when set, the agent is launched with `claude --resume
-    <id>` so it wakes back into its prior conversation (the wake path).
-
-    Raises spawner.ChannelResolutionError on bad channels, RuntimeError on
-    spawn failures (callers convert to HTTP errors or log).
-    """
-    task_id = task["task_id"]
-    plugins = json.loads(task["plugins"]) if task["plugins"] else []
-    model = task.get("model")
-    cwd = task.get("cwd")
-    channels = json.loads(task["channels"]) if task.get("channels") else []
-    kind = task.get("kind", "task")
-    success = spawner.spawn_tmux(
-        task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind,
-        resume_session_id=resume_session_id,
-    )
-    if not success:
-        raise RuntimeError(
-            f"spawn failed for {task_id}: tmux session could not be launched"
-        )
+app = FastAPI(title="taskpilot-daemon")
 
 
-def reconcile_once() -> dict:
-    """One reconciler pass. Returns counts for logging/metrics.
-
-    Read DB, check tmux for each running task, take action, write DB back.
-    Synchronous so we can run it via asyncio.to_thread from the loop.
-    """
-    counts = {"checked": 0, "alive": 0, "respawned": 0, "crashed": 0, "failed": 0, "dormant": 0}
-    conn = store.get_db()
-    try:
-        running = store.list_tasks(conn, "running")
-    except Exception as e:
-        conn.close()
-        log.error("reconcile: failed to list tasks: %s", e)
-        return counts
-
-    for task in running:
-        task_id = task["task_id"]
-        kind = task.get("kind", "task")
-        counts["checked"] += 1
-
-        if spawner.is_tmux_alive(task_id):
-            # Capture the session id once the agent has produced a transcript,
-            # so we can resume it on wake. (Does NOT stamp last_seen — that's
-            # activity, set by the agent's hooks, and is what idle is measured
-            # from. Stamping it here on mere liveness would make nothing ever
-            # look idle.)
-            if not task.get("session_id"):
-                sid = spawner.capture_session_id(task_id, cwd=task.get("cwd"))
-                if sid:
-                    store.set_session_id(conn, task_id, sid)
-            # Idle TTL: recycle a long-idle agent into 'dormant' (process down,
-            # identity intact, wakes on next message). Never 'completed' — idle
-            # is not done.
-            idle = _idle_seconds(task.get("last_seen_at"))
-            if IDLE_TTL_S and idle is not None and idle > IDLE_TTL_S:
-                log.info("reconcile: %s idle %.0fs > %ds — going dormant",
-                         task_id, idle, IDLE_TTL_S)
-                spawner.kill_tmux(task_id)
-                store.update_status(conn, task_id, "dormant")
-                counts["dormant"] += 1
-            else:
-                counts["alive"] += 1
-            continue
-
-        # tmux died. Service-kind: try to bring it back. Task-kind: mark crashed.
-        if kind == "service":
-            log.warning("reconcile: tmux dead for service %s — respawning", task_id)
-            try:
-                _spawn_body(task)
-                store.increment_invocation(conn, task_id)
-                counts["respawned"] += 1
-            except Exception as e:
-                log.error("reconcile: respawn of %s failed: %s", task_id, e)
-                store.mark_crashed(conn, task_id, f"reconciler respawn failed: {e}")
-                counts["failed"] += 1
-        else:
-            log.info("reconcile: tmux dead for task %s — marking crashed", task_id)
-            store.mark_crashed(conn, task_id, "tmux died (reconciler)")
-            counts["crashed"] += 1
-
-    conn.close()
-    return counts
-
-
-async def reconcile_loop() -> None:
-    """Background async loop. Runs reconcile_once on RECONCILE_INTERVAL_S cadence.
-
-    First pass fires immediately on daemon boot — that's what brings services
-    back up after a host reboot. Sleep is at the *end* so a slow tick doesn't
-    delay the next tick beyond the interval.
-    """
-    while True:
-        try:
-            counts = await asyncio.to_thread(reconcile_once)
-            if any(counts[k] for k in ("respawned", "crashed", "failed")):
-                log.info(
-                    "reconcile: checked=%d alive=%d respawned=%d crashed=%d failed=%d",
-                    counts["checked"], counts["alive"], counts["respawned"],
-                    counts["crashed"], counts["failed"],
-                )
-        except Exception as e:
-            log.exception("reconcile: unhandled error: %s", e)
-        await asyncio.sleep(RECONCILE_INTERVAL_S)
-
-
-# --- Lifespan ---
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("taskpilot daemon starting (reconcile interval=%ds)", RECONCILE_INTERVAL_S)
-    task = asyncio.create_task(reconcile_loop())
-    yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    log.info("taskpilot daemon stopping")
-
-
-app = FastAPI(title="taskpilot-daemon", lifespan=lifespan)
-
-
-# --- Read endpoints (live in phase 0) ---
+# --- Read endpoints ---
 
 
 @app.get("/health")
 def health() -> HealthResponse:
-    """Daemon health + how many tasks are under our supervision."""
-    conn = store.get_db()
-    running = store.list_tasks(conn, "running")
-    everything = store.list_tasks(conn)
-    conn.close()
+    """Daemon health + how many tasks are marked running."""
+    with store.db() as conn:
+        running = store.list_tasks(conn, "running")
+        everything = store.list_tasks(conn)
     return HealthResponse(
         ok=True,
         version="0.1.0",
-        supervised=len(running),
+        running=len(running),
         total=len(everything),
     )
 
@@ -260,18 +101,16 @@ def _read_state(task_id: str) -> dict | None:
 @app.get("/tasks")
 def list_tasks(status: str | None = None) -> list[dict]:
     """List tasks with live health. Optional ?status= filter."""
-    conn = store.get_db()
-    tasks = store.list_tasks(conn, status)
-    conn.close()
+    with store.db() as conn:
+        tasks = store.list_tasks(conn, status)
     return [_enrich(t) for t in tasks]
 
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str) -> dict:
     """Full task detail with live health and state.json."""
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    conn.close()
+    with store.db() as conn:
+        task = store.get_task(conn, task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
     _enrich(task)
@@ -279,108 +118,102 @@ def get_task(task_id: str) -> dict:
     return task
 
 
-def _capture_live(task_id: str, lines: int) -> dict | None:
-    """Live-tmux capture; returns None when session is gone or capture fails."""
-    session = spawner.tmux_session_name(task_id)
-    if not spawner.is_tmux_alive(task_id):
-        return None
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", f"{session}:0.0", "-p"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if result.returncode != 0:
-        return None
-    return {"output": tail.tail_str(result.stdout, lines), "source": "tmux"}
-
-
-def _read_pane_log(task_id: str, lines: int) -> dict | None:
-    """File-tail of pane.log; returns None when the file is absent."""
-    p = spawner.pane_log_path(task_id)
-    if not p.exists():
-        return None
-    return {"output": tail.tail_lines(p, lines), "source": "pane.log"}
-
-
-@app.get("/tasks/{task_id}/log")
-def get_log(task_id: str, lines: int = 50) -> dict:
-    """Three-tier log read: live tmux pane → pane.log file → 404.
-
-    `source` field in the response indicates which tier served the call:
-      "tmux"     — live capture-pane (richer formatting; current state)
-      "pane.log" — persistent file (history after task ends)
-    """
-    live = _capture_live(task_id, lines)
-    if live is not None:
-        return {"task_id": task_id, **live}
-    file_result = _read_pane_log(task_id, lines)
-    if file_result is not None:
-        return {"task_id": task_id, **file_result}
-    raise HTTPException(status_code=404, detail="no log available")
-
-
 # --- Write endpoints ---
-#
-# /spawn and /kill handle both kind=task and kind=service. The kind difference
-# is reconciler treatment, not spawn path: services auto-respawn on tmux
-# death, tasks get marked crashed. Both go through spawner.spawn_tmux.
 
 
 @app.post("/tasks/{task_id}/spawn")
 def spawn(task_id: str) -> dict:
     """Spawn a task in tmux."""
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    if not task:
-        conn.close()
-        raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
-    if task["status"] == "running":
-        conn.close()
-        raise HTTPException(status_code=409, detail=f"task '{task_id}' is already running")
+    with store.db() as conn:
+        task = store.get_task(conn, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
+        if task["status"] == "running":
+            raise HTTPException(status_code=409, detail=f"task '{task_id}' is already running")
 
-    try:
-        _spawn_body(task)
-    except spawner.ChannelResolutionError as e:
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"channel validation failed: {e}")
-    except RuntimeError as e:
-        conn.close()
-        raise HTTPException(status_code=502, detail=str(e))
+    # spawn_tmux blocks ~16s — do it outside any open DB connection.
+    plugins = json.loads(task["plugins"]) if task["plugins"] else []
+    success = spawner.spawn_tmux(
+        task_id, plugins, model=task.get("model"), cwd=task.get("cwd"),
+    )
+    if not success:
+        raise HTTPException(status_code=502, detail=f"spawn failed for {task_id}: tmux session could not be launched")
 
-    store.update_status(conn, task_id, "running")
-    store.increment_invocation(conn, task_id)
-    store.mark_seen(conn, task_id)  # baseline activity stamp for the idle clock
-    conn.close()
+    with store.db() as conn:
+        store.update_status(conn, task_id, "running")
+        store.increment_invocation(conn, task_id)
 
     spawner.send_initial_prompt(task_id, task["description"])
 
     return {
         "status": "running",
         "task_id": task_id,
-        "kind": task.get("kind", "task"),
         "tmux_session": spawner.tmux_session_name(task_id),
-        "channel_healthy": True,
+        "channel_healthy": spawner.channel_healthy(task_id),
+    }
+
+
+@app.post("/tasks/create_and_spawn")
+def create_and_spawn(body: CreateSpawnRequest) -> dict:
+    """Create a task and immediately spawn it in one call.
+
+    Mirrors the MCP `define_task` + `spawn_task` pair for callers that don't
+    hold a prior task row (the dispatcher's `spawn:<recipe>` path). The task_id
+    is slugified from `name` (or the description) — passing an already-slugged
+    name is idempotent, so callers that predict the task_id locally get the
+    same value back.
+    """
+    name = body.name or body.description[:80]
+    task_id = spawner.slugify(name)
+
+    with store.db() as conn:
+        existing = store.get_task(conn, task_id)
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"task '{task_id}' already exists with status '{existing['status']}'",
+            )
+        store.create_task(
+            conn, task_id, name, body.description,
+            None, body.brief or {}, body.model, body.cwd,
+        )
+    spawner.write_task_config(task_id, name, body.description, [], body.brief or {})
+
+    # spawn_tmux blocks ~16s — do it outside any open DB connection.
+    success = spawner.spawn_tmux(
+        task_id, [], model=body.model, cwd=body.cwd,
+    )
+    if not success:
+        raise HTTPException(
+            status_code=502,
+            detail=f"spawn failed for {task_id}: tmux session could not be launched",
+        )
+
+    with store.db() as conn:
+        store.update_status(conn, task_id, "running")
+        store.increment_invocation(conn, task_id)
+
+    spawner.send_initial_prompt(task_id, body.description)
+
+    return {
+        "ok": True,
+        "status": "running",
+        "task_id": task_id,
+        "tmux_session": spawner.tmux_session_name(task_id),
+        "channel_healthy": spawner.channel_healthy(task_id),
     }
 
 
 @app.post("/tasks/{task_id}/kill")
 def kill(task_id: str) -> dict:
-    """Kill a running task. Reconciler doesn't touch killed tasks (its filter
-    is status='running'), so killing a service stops the auto-respawn cycle."""
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    if not task:
-        conn.close()
-        raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
-
-    tmux_killed = spawner.kill_tmux(task_id)
-    spawner.cleanup_project_mcps(task_id)
-    store.update_status(conn, task_id, "killed")
-    conn.close()
+    """Kill a running task — stop its tmux session and clean up project MCPs."""
+    with store.db() as conn:
+        task = store.get_task(conn, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
+        tmux_killed = spawner.kill_tmux(task_id)
+        spawner.cleanup_project_mcps(task_id)
+        store.update_status(conn, task_id, "killed")
 
     return {
         "task_id": task_id,
@@ -391,69 +224,22 @@ def kill(task_id: str) -> dict:
 
 @app.post("/tasks/{task_id}/message")
 def message(task_id: str, body: MessageRequest) -> dict:
-    """Forward a message to a task via session-bridge, waking it if dormant.
-
-    A dormant agent (process recycled after idle, identity intact) is woken by
-    contacting it: we respawn it resumed into its prior conversation, wait for
-    its channel to register, then deliver. The message is the alarm clock."""
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
+    """Forward a message to a running task via session-bridge."""
+    with store.db() as conn:
+        task = store.get_task(conn, task_id)
     if not task:
-        conn.close()
         raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
 
-    woke = False
     if not spawner.channel_healthy(task_id):
-        # Only a DORMANT agent (idle-recycled, identity intact) is woken on
-        # contact. Any other unreachable state (pending/crashed/running-flaky)
-        # keeps the old 502 — spawn or let the reconciler recover it.
-        if task.get("status") == "dormant":
-            sid = task.get("session_id")
-            log.info("wake: %s dormant — respawning%s", task_id,
-                     f" --resume {sid}" if sid else " (no session id; cold)")
-            try:
-                _spawn_body(task, resume_session_id=sid)
-            except Exception as e:
-                conn.close()
-                raise HTTPException(status_code=502, detail=f"wake failed: {e}")
-            store.update_status(conn, task_id, "running")
-            store.increment_invocation(conn, task_id)
-            store.mark_seen(conn, task_id)
-            woke = True
-            conn.close()
-            # A resumed (--resume) cold start is slower than a fresh spawn: the
-            # agent replays its transcript before the channel re-registers
-            # (observed ~45-60s+). Give it a generous window.
-            if not spawner.wait_for_channel(task_id, timeout=int(os.environ.get("TASKPILOT_WAKE_TIMEOUT_S", "120"))):
-                raise HTTPException(status_code=504, detail=f"task '{task_id}' woke but channel did not register")
-        else:
-            conn.close()
-            raise HTTPException(
-                status_code=502,
-                detail=f"task '{task_id}' channel not reachable via session-bridge",
-            )
-    else:
-        conn.close()
-
-    payload = json.dumps({
-        "text": body.text,
-        "from_session": body.from_session or "taskpilot-daemon",
-    })
-    try:
-        result = subprocess.run(
-            ["curl", "-s", "-X", "POST", "-H", "Content-Type: application/json",
-             "-d", payload, f"{spawner.SESSION_BRIDGE_URL}/sessions/{task_id}/message"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+        raise HTTPException(
+            status_code=502,
+            detail=f"task '{task_id}' channel not reachable via session-bridge",
         )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="timeout sending message")
 
-    return {"delivered": result.returncode == 0, "woke": woke, "response": result.stdout}
-
-
-# --- Entry point ---
+    delivered = spawner.post_to_channel(
+        task_id, body.text, body.from_session or "taskpilot-daemon"
+    )
+    return {"delivered": delivered}
 
 
 # --- Boot-persistence service installation (systemd on Linux, launchd on macOS) ---
@@ -470,9 +256,8 @@ def _resolve_uv() -> str:
     """Find an absolute path to the `uv` binary, falling back to bare 'uv'.
 
     The daemon's plugin deps (mcp, fastapi, uvicorn) live in the plugin's uv
-    venv, not in system python. Bare `python3` here would fail to import
-    fastapi the first time the unit starts. `uv run --directory <plugin>` is
-    the only invocation that finds the right interpreter on every host.
+    venv, not in system python. `uv run --directory <plugin>` is the only
+    invocation that finds the right interpreter on every host.
     """
     found = subprocess.run(["which", "uv"], capture_output=True, text=True).stdout.strip()
     return found or "uv"
@@ -539,7 +324,7 @@ def _launchd_plist_text() -> str:
     AbandonProcessGroup mirrors the systemd unit's `KillMode=process`: the
     daemon spawns detached tmux sessions per task, and launchd must not tear
     those down when it stops/restarts the daemon. KeepAlive.SuccessfulExit=false
-    mirrors `Restart=on-failure` — restart on crash, not on a clean exit.
+    mirrors `Restart=on-failure`.
     """
     uv = _resolve_uv()
     plugin_root = str(Path(__file__).resolve().parent)
@@ -581,7 +366,6 @@ def install_launchd_agent() -> None:
     LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHD_PLIST_PATH.write_text(_launchd_plist_text())
     print(f"wrote {LAUNCHD_PLIST_PATH}")
-    # Unload first so a changed plist actually takes effect; ignore "not loaded".
     subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST_PATH)], check=False,
                     capture_output=True)
     subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST_PATH)], check=True)

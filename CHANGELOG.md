@@ -2,6 +2,84 @@
 
 All notable changes to taskpilot.
 
+## 0.13.0 — 2026-06-05
+
+Major pare-down to the irreducible core: a local service exposing an HTTP API
+for running long-running Claude Code agents. The `taskpilot-daemon` is the
+product; the MCP server is a thin client over it. Everything bolted on top of
+that core was removed.
+
+### Removed
+
+- **Scheduling / cron.** Deleted `scheduler.py` and the `schedule_task` /
+  `list_scheduled_tasks` / `remove_scheduled_task` MCP tools. Dropped the
+  `scheduling` entry from `built_in_capabilities` and the scheduling section
+  from the generated agent CLAUDE.md. Drive recurrence externally by POSTing a
+  message to the agent's channel.
+- **Remote / mesh spawn.** Deleted `spawn_remote`, `lookup_peer_url`,
+  `is_self_host`, `_list_mesh_hosts`, and the `host=` parameter. The service
+  runs agents on its own machine only.
+- **`kind=service` + auto-respawn reconciler.** Deleted the reconciler loop,
+  `reconcile_once` / `reconcile_loop`, the FastAPI lifespan task, idle dormancy
+  (`IDLE_TTL_S`), and the resume-on-wake path. Every task is one-shot; the
+  daemon is now purely reactive. Dropped the `kind` parameter and column usage.
+- **Lifecycle hooks.** Deleted the `hooks/` directory (`on-stop.py`,
+  `on-notification.py`, `on-prompt.py`, `_record.py`), `write_hook_settings`,
+  and the `--settings` launch flag. No more `agent.json` / `events.jsonl`
+  recording, `capture_session_id`, or `last_seen_at` / `session_id` tracking.
+- **`destroy_task` and `respawn_task` MCP tools**, plus `store.delete_task`.
+  `kill_task` is the only teardown. (A killed task's row persists, so
+  re-creating with the same name errors — pick a new name.)
+- **Aux scripts.** Deleted `spawner_cli.py`, `task_relay.sh`,
+  `taskpilot-recover.sh`, and the entire `tests/` suite.
+
+### Cleanup
+
+- **Dropped capability → plugin resolution.** Removed `resolve_capabilities` +
+  `_import_softwaresoftware` and taskpilot's runtime reach into softwaresoftware's
+  `resolver`/`registry` internals (the `sys.path` injection). It resolved
+  *installed* plugins and re-loaded them via `--plugin-dir` (a dev-mode flag for
+  *un*installed plugins) — redundant, since the spawned agent already inherits
+  every installed plugin from the real `~/.claude`. `capabilities` in the brief
+  are now documentation nudges in the generated CLAUDE.md only.
+- **Dropped the `channels` param + channel validation.** The agent gets exactly
+  one channel (session-bridge, a hard dependency). Removed `validate_channels`,
+  `ChannelResolutionError`, the `channels` column/param, and the now-orphaned
+  `_read_json` / `INSTALLED_PLUGINS_PATH` / `import sys`.
+- **Removed the `get_task_log` tool and the daemon `/log` endpoint.** Watch a
+  live agent with `tmux attach -t <task_id>` instead. (MCP tools: 7 → 6.)
+- **Renamed the `create_task` MCP tool to `define_task`** — it defines/configures
+  a task; `spawn_task` is what launches it. (`store.create_task`, the storage-layer
+  insert, keeps its name.)
+- **Dropped pane.log.** Removed the whole `tmux pipe-pane` tee + size-cap/
+  truncation machinery (~90 lines) and `tail.py`. `get_task_log` now captures
+  the live tmux pane only — no post-mortem logs after a session ends.
+- **`curl` → `urllib`.** All three session-bridge calls (`channel_healthy`,
+  `send_initial_prompt`, the daemon `/message` endpoint) now use `urllib`
+  instead of shelling out to `curl`, dropping the external dependency. The two
+  identical POSTs collapse into one `spawner.post_to_channel()` helper.
+- **`store.db()` context manager** replaces the manual `get_db()` / `close()`
+  pattern across all 8 call sites, fixing the latent connection leak where a
+  handler closed the connection then raised on a separate path.
+- **Folded the daemon-down error into `_daemon_call`** so each MCP tool body is
+  a single `return _daemon_call(...)` (was a repeated `is not None` ternary).
+- Inlined the single-caller `_spawn_body`; removed dead constants
+  (`TASKPILOT_DIR` in server/daemon, `PLUGIN_ROOT` in spawner) and now-unused
+  imports (`shlex`, `shutil`, `datetime`).
+
+### Changed
+
+- **MCP server is now a true thin client.** Removed all in-process fallbacks
+  for spawn/kill/message/list/get/log — these go through the daemon, which must
+  be running. If it isn't, tools return a clear "daemon is not reachable" error.
+  `define_task` is the only tool that still runs in-process (writes the DB row +
+  config files).
+- Tool surface trimmed from 12 → 6: `define_task`, `spawn_task`, `list_tasks`,
+  `get_task`, `send_message`, `kill_task`.
+- `store.py` schema trimmed to the columns the core uses; obsolete columns on
+  pre-existing DBs are left in place (harmless).
+- `make test` is now an import smoke check (the test suite was retired).
+
 ## 0.12.1 — 2026-06-04
 
 ### Removed

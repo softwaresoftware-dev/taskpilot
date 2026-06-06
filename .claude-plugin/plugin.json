@@ -1,7 +1,7 @@
 {
   "name": "taskpilot",
-  "description": "Spawn and manage long-running autonomous Claude Code sessions for background tasks",
-  "version": "0.12.1",
+  "description": "A local service exposing an HTTP API to spawn and manage long-running autonomous Claude Code agents",
+  "version": "0.13.0",
   "author": {
     "name": "NOV LLC",
     "url": "https://github.com/softwaresoftware-dev"
@@ -14,11 +14,7 @@
     "task",
     "tmux",
     "channel",
-    "scheduling",
-    "cron"
-  ],
-  "built_in_capabilities": [
-    "scheduling"
+    "daemon"
   ],
   "mcpServers": {
     "taskpilot": {

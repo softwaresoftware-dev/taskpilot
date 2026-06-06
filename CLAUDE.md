@@ -1,6 +1,11 @@
 # CLAUDE.md — taskpilot
 
-Spawn and manage long-running autonomous Claude Code sessions. Each task runs in its own tmux session, addressable through session-bridge by its task id. A long-lived supervisor daemon owns the lifecycle.
+A local service that exposes an HTTP API for running long-running autonomous
+Claude Code agents. The `taskpilot-daemon` is the product: a boot-persistent
+process on `:8912` that spawns each agent in its own tmux session and owns its
+spawn/kill/message lifecycle. The MCP server is a thin client over that API so
+a Claude session can drive it. Agents are addressable by task id through
+session-bridge.
 
 ## Quick Reference
 
@@ -15,60 +20,51 @@ Spawn and manage long-running autonomous Claude Code sessions. Each task runs in
 - Python 3.11+, FastMCP, FastAPI, SQLite
 - tmux (session management)
 - session-bridge (message routing)
-- A single `taskpilot-daemon.service` systemd user unit supervises all tasks
+- A single `taskpilot-daemon` boot service (systemd user unit on Linux, launchd agent on macOS)
 
 ## Platform support
 
-Linux and macOS natively (tmux dep). **Windows: via WSL2** — Claude Code
-runs inside the WSL distro, taskpilot installs and behaves identically to
-native Linux from inside WSL. There is no Windows-native code path because
-spawning + supervising claude subprocesses currently goes through tmux;
-porting that to plain `subprocess.Popen` + log-tail (instead of attach) is
-on the roadmap.
+Linux and macOS natively (tmux dep). **Windows: via WSL2** — Claude Code runs
+inside the WSL distro, taskpilot installs and behaves identically to native
+Linux from inside WSL. There is no Windows-native code path because spawning
+claude subprocesses currently goes through tmux.
 
 The marketplace `environment` stays `{os: [linux, darwin]}` so the resolver
-refuses install on native Windows — operators get a clear failure rather
-than a half-working install. Inside WSL, `probe_os` returns "linux" so the
-resolver accepts the install transparently.
-
-WSL setup gotchas for taskpilot specifically:
-
-- The dispatcher and dashboard are daemons. WSL2 shuts down when all
-  shells exit — keep one open, or enable systemd in `wsl.conf` and run
-  `wsl --shutdown-timeout` so units survive.
-- Webhook ingress works via Cloudflare tunnel running inside WSL.
-- Notifications: `notify-send` doesn't work without WSLg + a display
-  server. Use `notify-slack` / `notify-email` instead.
+refuses install on native Windows. Inside WSL, `probe_os` returns "linux" so
+the resolver accepts the install transparently.
 
 ## How It Works
 
-1. `create_task()` writes config to `~/.taskpilot/<id>/`.
-2. `spawn_task()` POSTs to the daemon's `/tasks/<id>/spawn`. The daemon launches Claude in a fresh tmux session.
-3. Claude is launched with `--name <task_id>` and `SESSION_NAME=<task_id>` exported into its env. session-bridge's `channel.mjs` reads `SESSION_NAME` (along with `SESSION_NAMESPACE` and `SESSION_LABELS`) and includes them in its `/register` payload, so the mesh names the session under the task id.
-4. Claude is also launched with `--settings <task_dir>/hook-settings.json` so per-task `Stop`, `Notification`, and `UserPromptSubmit` hooks fire (see "Lifecycle Hooks" below).
-5. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
-6. External callers (taskboard "msg" button, cron schedules) send messages the same way.
-7. The daemon's reconciler tick (every 60s) walks running tasks. If a service's tmux died, it respawns. If a task's tmux died, it marks crashed.
-8. Completion is never inferred from the agent's prose. An idle agent is just recycled to `dormant` by the reconciler (process down, identity intact, wakes on the next message). If a task ever needs a terminal `completed` state, that must come from an explicit signal, not a guess.
+1. `define_task()` writes config to `~/.taskpilot/<id>/` and a row to the DB. This is the one MCP call that runs in-process — everything else goes through the daemon.
+2. `spawn_task()` POSTs to the daemon's `/tasks/<id>/spawn`. The daemon launches Claude in a fresh tmux session via `spawner.spawn_tmux`.
+3. Claude is launched with `--name <task_id>` and `SESSION_NAME=<task_id>` exported into its env. session-bridge's `channel.mjs` reads `SESSION_NAME` (and `SESSION_NAMESPACE`) and includes them in its `/register` payload, so the mesh names the session under the task id.
+4. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
+5. External callers (e.g. a taskboard "msg" button) send messages the same way.
+
+The daemon is **reactive**: it acts on API calls, not on a background timer.
+There is no reconciler, no auto-respawn, and no completion inference. A task's
+status reflects the last lifecycle call (`pending` → `running` → `killed`).
+Liveness (is the agent's tmux still alive) is computed on demand whenever a
+task is listed or fetched (`tmux_alive`, `channel_healthy`). A task whose tmux
+has died still shows `status: running` with `tmux_alive: false` — re-launch it
+by killing it first (clears the status) then spawning again.
 
 ## Supervisor Daemon
 
 `daemon.py` runs as a boot-persistence service on port `:8912` — a systemd user unit (`taskpilot-daemon.service`) on Linux, a launchd agent (`com.softwaresoftware.taskpilot-daemon`) on macOS. It exposes:
 
-- `GET /health` — daemon status + supervised task count
+- `GET /health` — daemon status + running/total task counts
 - `GET /tasks` — list with live tmux/channel health
 - `GET /tasks/<id>` — task detail + state.json
-- `GET /tasks/<id>/log` — tmux pane capture
 - `POST /tasks/<id>/spawn` — launch via `spawner.spawn_tmux`, send initial prompt, flip status to running
-- `POST /tasks/<id>/kill` — kill tmux, clean MCPs, flip status to killed
+- `POST /tasks/<id>/kill` — kill tmux, clean project MCPs, flip status to killed
 - `POST /tasks/<id>/message` — proxy to session-bridge
+- `POST /tasks/create_and_spawn` — define + spawn in one call, for event-driven callers (e.g. the dispatcher's `spawn:<recipe>` path) that hold no prior task row. Body: `{description, name?, cwd?, model?, brief?}`. The task_id is slugified from `name` (or the description); idempotent for a caller that predicts the id. No MCP-tool equivalent — HTTP only.
 
-Both `kind=task` and `kind=service` use the same spawn path. The kind difference is reconciler treatment, not spawn behaviour:
-
-- `kind=service` — auto-respawned by the reconciler on tmux death
-- `kind=task` — marked `crashed` on tmux death (one-shot semantics)
-
-The MCP server (`server.py`) is a thin client — `_daemon_call()` POSTs to the daemon, falling back to in-process spawn when the daemon is unreachable so the tool works in tests and pre-daemon installs.
+The MCP server (`server.py`) is a thin client: `_daemon_call()` POSTs to the
+daemon and there is **no in-process fallback** — if the daemon is down, the
+tools return a clear "daemon is not reachable" error. The daemon is the
+service; it must be running.
 
 Install or update the boot-persistence service (systemd on Linux, launchd on macOS — auto-detected):
 
@@ -78,35 +74,26 @@ python3 daemon.py --uninstall    # stop, disable, remove
 journalctl --user -u taskpilot-daemon -f
 ```
 
-The reconciler interval is configurable via `TASKPILOT_RECONCILE_INTERVAL_S` (default 60s).
-
-## Lifecycle Hooks
-
-Spawned agents run with three Claude Code hooks registered via `--settings`:
-
-- **`Stop`** → `hooks/on-stop.py` — fires when the assistant finishes a turn. Records `last_assistant_message`, timestamp, and session id to `state/agent.json`, and stamps `last_seen_at` so the idle clock resets. No classification, no completion-kill — the hook only records.
-- **`Notification`** → `hooks/on-notification.py` — fires when Claude has been idle at a prompt past ~6s. Records `notification_type` (`permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog`) plus message and title.
-- **`UserPromptSubmit`** → `hooks/on-prompt.py` — fires when an inbound prompt arrives (mesh message or user input). Records the prompt (truncated) so received-vs-replied can be paired against the matching Stop event.
-
-All three share `hooks/_record.py` for the read-modify-write of `agent.json` and the `events.jsonl` audit log. They no-op when `TASKPILOT_TASK_ID` is unset, which keeps them safe if the settings file is loaded outside a taskpilot context. Each hook also calls `mark_seen()` to stamp `tasks.last_seen_at = now`.
-
-The hooks are record-only. Earlier versions ran an LLM/regex classifier in the Stop hook that inferred completion from the agent's final message and killed the session; that was removed. Completion is no longer guessed from prose — idle agents are recycled to `dormant` by the reconciler and wake on the next message.
-
 ## Architecture
 
 - Messaging routes through the session-bridge daemon at `http://127.0.0.1:8910`.
-- Supervision lives in `taskpilot-daemon` at `http://127.0.0.1:8912`.
+- The lifecycle service lives in `taskpilot-daemon` at `http://127.0.0.1:8912`.
 - Project-scoped MCPs from the task's `cwd/.claude/settings.json` are registered into `~/.claude.json` at launch (and cleaned up on kill via `project_mcps.json`).
 - Trust dialog + channels warning auto-accepted via `tmux send-keys Enter`.
 
 ## Agent environment
 
-Each spawned agent inherits the user's real `~/.claude` environment — global `CLAUDE.md`, rules, every installed plugin's skills, and every registered MCP server. It runs with the user's real `$HOME` (no isolation): the agent is the same OS user with the same toolchain and credentials. Per-task context comes from the `CLAUDE.md` that `write_task_config` drops at the task dir (the agent's cwd). Claude Code stores the agent's transcripts under `~/.claude/projects/<encoded-cwd>/`, which is how `capture_session_id` finds the session UUID for resume-on-wake.
+Each spawned agent inherits the user's real `~/.claude` environment — global
+`CLAUDE.md`, rules, every installed plugin's skills, and every registered MCP
+server. It runs with the user's real `$HOME` (no isolation): the agent is the
+same OS user with the same toolchain and credentials. Per-task context comes
+from the `CLAUDE.md` that `write_task_config` drops at the task dir (the
+agent's cwd).
 
 ## Data
 
 - Database: `~/.taskpilot/taskpilot.db` (SQLite with WAL mode)
-- Task configs: `~/.taskpilot/<task_id>/` (CLAUDE.md, state.json, brief.json, hook-settings.json)
+- Task configs: `~/.taskpilot/<task_id>/` (CLAUDE.md, state.json, brief.json, prompt.txt)
 - Daemon journal: `journalctl --user -u taskpilot-daemon`
 
 ## Development
@@ -114,9 +101,15 @@ Each spawned agent inherits the user's real `~/.claude` environment — global `
 ```bash
 pip install "mcp[cli]" "fastapi>=0.115" "uvicorn[standard]>=0.30"
 python server.py                # run MCP server
-python daemon.py                # run supervisor daemon (foreground; --install to register systemd unit)
-make test                       # run tests
+python daemon.py                # run supervisor daemon (foreground; --install to register the boot service)
+make daemon-status              # curl the daemon's /health
 ```
+
+There is no automated test suite — it was retired with the feature pare-down.
+Sanity-check a change by importing the modules
+(`uv run python -c "import store, spawner, server, daemon"`) and, for the spawn
+path, doing a real `define_task` → `spawn_task` → `send_message` → `kill_task`
+against a running daemon + session-bridge.
 
 Install as plugin:
 ```bash
@@ -125,20 +118,18 @@ claude --plugin-dir /home/thatcher/projects/softwaresoftware/projects/plugins/pr
 
 ## MCP Tools
 
-- `create_task(name, description, plugins?, operating_brief?, model?, kind?, host?)` — create task config + allocate port. kind="service" for reboot-persistent agents. host="<peer>" to launch the agent on a remote mesh host (forwards spawn to that peer's session-bridge `/spawn`). `plugins` is a list of dev-mode `--plugin-dir` filesystem paths.
-- `spawn_task(task_id)` — launch tmux session (~16s startup). When the task carries `host` and that host is not self, forwards to the peer's `POST /spawn` instead.
+- `define_task(name, description, plugins?, operating_brief?, model?, cwd?)` — write task config + allocate port (does not launch). `plugins` is a list of dev-mode `--plugin-dir` paths, only for plugins NOT already installed (installed ones are inherited). Runs in-process (writes the DB row + config files).
+- `spawn_task(task_id)` — launch tmux session via the daemon (~16s startup)
 - `list_tasks(status?)` — list all tasks with live health
 - `get_task(task_id)` — full detail + state.json
-- `send_message(task_id, message)` — POST to channel
-- `kill_task(task_id)` — kill tmux + clean up
-- `get_task_log(task_id, lines?)` — capture tmux pane output
-- `schedule_task(name, plugin, skill, interval, enabled?)` — create/update a cron schedule
-- `list_scheduled_tasks()` — list schedules for current task
-- `remove_scheduled_task(name)` — remove a schedule and its crontab entry
+- `send_message(task_id, message)` — POST to channel via the daemon
+- `kill_task(task_id)` — kill tmux + clean up via the daemon
+
+To watch an agent's live output, `tmux attach -t <task_id>`.
 
 ## Operating Brief
 
-The `operating_brief` parameter to `create_task` accepts a dict with:
+The `operating_brief` parameter to `define_task` accepts a dict with:
 
 | Key | Type | Purpose |
 |-----|------|---------|
@@ -146,9 +137,27 @@ The `operating_brief` parameter to `create_task` accepts a dict with:
 | `workflows` | list[str] | Ordered phases/steps |
 | `success_criteria` | list[str] | Completion conditions |
 | `boundaries` | list[str] | What NOT to do |
-| `capabilities` | list[str] | Required capabilities (auto-resolved via softwaresoftware) |
-| `schedule` | str | Cron expression for recurring agents (scheduling is built-in) |
+| `capabilities` | list[str] | Capabilities to remind the agent it has (e.g. `memory`, `human-approval`) |
 
-Capabilities declared in the brief are automatically resolved to provider plugins at task creation time. The agent's CLAUDE.md is dynamically generated with sections for each declared capability.
+Capabilities are **documentation only**: each one adds a guidance section to
+the agent's generated CLAUDE.md (e.g. "you have memory available, use it").
+The tools themselves are not resolved or installed here — the spawned agent
+inherits the user's full `~/.claude`, so every installed plugin and MCP is
+already present. taskpilot has no runtime dependency on softwaresoftware.
 
-Environment variable `TASKPILOT_TASK_ID` is exported in the tmux session so capability plugins can scope their storage per-task.
+Environment variable `TASKPILOT_TASK_ID` is exported in the tmux session so
+capability plugins can scope their storage per-task.
+
+## What this does NOT do (intentionally pared down)
+
+These were removed to keep taskpilot to its irreducible core. If you need one,
+it lived in git history before v0.13.0:
+
+- **Scheduling / cron** — no `schedule_task` family. Drive recurrence from an external scheduler that POSTs a message to the agent's channel.
+- **Remote / mesh spawn** — no `host=` forwarding. The service runs agents on its own machine only.
+- **`kind=service` + auto-respawn** — every task is one-shot. No reconciler brings a dead agent back.
+- **Idle dormancy / resume-on-wake** — no lifecycle hooks, no `--resume` wake path.
+- **Log reads** — no `get_task_log` tool and no `pane.log`. To watch an agent, `tmux attach -t <task_id>`.
+- **Capability → plugin resolution** — `capabilities` in the brief are doc nudges only; installed plugins/MCPs come from the inherited `~/.claude`. No runtime softwaresoftware dependency.
+- **Extra dev channels** — the agent gets exactly one channel (session-bridge). No `channels` param, no channel-resolution validation.
+- **`destroy_task` / `respawn_task`** — kill is the only teardown. (Note: a killed task's DB row persists, so re-creating a task with the same name returns an "already exists" error. Pick a new name, or clear the row from `~/.taskpilot/taskpilot.db`.)

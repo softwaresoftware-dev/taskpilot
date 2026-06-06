@@ -1,39 +1,33 @@
-"""MCP server for taskpilot — task lifecycle, messaging, and scheduling.
+"""MCP server for taskpilot — task lifecycle and messaging.
 
-The MCP server is a thin client over the taskpilot supervisor daemon for
-spawn/kill/message. Falls back to direct (in-process) calls if the daemon
-isn't running, so tests and pre-daemon installs keep working. Phase 3
-cleanup will remove the fallback once the daemon is mandatory.
+A thin client over the taskpilot supervisor daemon (daemon.py). `define_task`
+writes config + a DB row locally; every lifecycle call (spawn/kill/message,
+plus the reads) goes through the daemon's HTTP API. The daemon is the service
+that actually owns running agents, so it must be up — if it's unreachable the
+tools return a clear error rather than silently doing the work in-process.
 """
 
 import json
 import os
-import subprocess
-import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-import scheduler
 import spawner
 import store
-import tail
 
 mcp = FastMCP("taskpilot")
 
-TASKPILOT_DIR = Path.home() / ".taskpilot"
 DAEMON_URL = os.environ.get("TASKPILOT_DAEMON_URL", "http://127.0.0.1:8912")
 
 
-def _daemon_call(method: str, path: str, json_body: dict | None = None) -> dict | None:
+def _daemon_call(method: str, path: str, json_body: dict | None = None) -> dict | list:
     """Call the taskpilot supervisor daemon over HTTP.
 
-    Returns:
-      dict with the daemon's JSON response on 2xx.
-      dict {"error": "..."} on non-2xx (caller surfaces to user).
-      None if the daemon is unreachable (caller falls back to direct call).
+    Every response is a value the tool can return directly:
+      dict/list — the daemon's JSON response on 2xx.
+      {"error": ...} — on a non-2xx, or when the daemon is unreachable.
     """
     url = f"{DAEMON_URL}{path}"
     data = json.dumps(json_body).encode() if json_body else None
@@ -51,78 +45,57 @@ def _daemon_call(method: str, path: str, json_body: dict | None = None) -> dict 
         except Exception:
             return {"error": f"daemon returned {e.code}"}
     except urllib.error.URLError:
-        return None  # daemon down — caller falls back
+        return {
+            "error": f"taskpilot daemon is not reachable at {DAEMON_URL}. "
+            "Start it with `python daemon.py` (or install it: `python daemon.py --install`)."
+        }
 
 
 @mcp.tool()
-def create_task(
+def define_task(
     name: str,
     description: str,
     plugins: list[str] | None = None,
     operating_brief: dict | None = None,
     model: str | None = None,
     cwd: str | None = None,
-    channels: list[str] | None = None,
-    kind: str = "task",
-    host: str | None = None,
 ) -> dict:
-    """Create a new autonomous task. Writes config files and allocates a channel port.
+    """Define a new autonomous task. Writes config files and allocates a channel port.
+
+    This only defines the task — call spawn_task(task_id) to launch it.
 
     Args:
         name: Human-readable task name (e.g., "Sell my lawnmower").
         description: Full task description — what the agent should do.
-        plugins: Optional list of plugin directory paths to load (dev-mode
-            --plugin-dir flags).
+        plugins: Optional list of plugin directory paths to load as dev-mode
+            --plugin-dir flags. Only needed for plugins NOT already installed —
+            the agent inherits the user's full ~/.claude (all installed plugins
+            and MCP servers) automatically.
         operating_brief: Optional dict with richer task definition. Keys:
             objectives (list[str]): Measurable goals.
             workflows (list[str]): Ordered phases/steps.
             success_criteria (list[str]): How to know the task is done.
             boundaries (list[str]): What NOT to do.
-            capabilities (list[str]): Required capabilities (e.g. ["memory", "scheduling"]).
-            schedule (str): Cron expression for recurring agents.
+            capabilities (list[str]): Capabilities to remind the agent it has
+                (e.g. ["memory"]). These become guidance sections in the
+                agent's CLAUDE.md — the tools themselves come from the inherited
+                environment, so nothing is resolved or installed here.
         model: Optional Claude model to use (e.g., "sonnet", "opus", "haiku").
         cwd: Optional working directory for the task (default: ~/.taskpilot/<task_id>/).
-        channels: Optional additional dev channel servers (e.g. ["server:session-bridge"]).
-        kind: "task" for one-shot jobs, "service" for always-on agents that survive reboots.
-        host: Optional mesh hostname to spawn on (e.g. "pixel-7-pro"). When set
-            and not the local host, spawn_task forwards the launch to that
-            peer's session-bridge daemon. None or self-host = local launch.
-            kind="service" is not yet supported for remote hosts.
 
     Returns:
         Task record with task_id, port, and status.
     """
-    if kind not in ("task", "service"):
-        return {"error": f"Invalid kind '{kind}'. Must be 'task' or 'service'."}
-
-    if host and kind == "service":
-        return {"error": "kind=service is not yet supported on remote hosts (no remote systemd install)"}
-
     task_id = spawner.slugify(name)
     plugins = plugins or []
     operating_brief = operating_brief or {}
-    channels = channels or []
 
-    # Auto-resolve capability plugins via nov-dependency-resolver
-    capabilities = operating_brief.get("capabilities", [])
-    if capabilities:
-        resolved = spawner.resolve_capabilities(capabilities)
-        for path in resolved:
-            if path not in plugins:
-                plugins.append(path)
+    with store.db() as conn:
+        existing = store.get_task(conn, task_id)
+        if existing:
+            return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
+        task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd)
 
-    conn = store.get_db()
-
-    # Check for duplicate
-    existing = store.get_task(conn, task_id)
-    if existing:
-        conn.close()
-        return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
-
-    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels, kind=kind, host=host)
-    conn.close()
-
-    # Write config files
     spawner.write_task_config(task_id, name, description, plugins, operating_brief)
 
     return task
@@ -130,119 +103,29 @@ def create_task(
 
 @mcp.tool()
 def spawn_task(task_id: str) -> dict:
-    """Launch a created task in a tmux session with its channel.
-
-    For kind=service, installs a systemd user service that survives reboots.
-    For kind=task (default), launches directly in tmux.
+    """Launch a created task in a tmux session with its channel (~16s startup).
 
     Args:
-        task_id: The task ID returned by create_task.
+        task_id: The task ID returned by define_task.
 
     Returns:
         Status of the spawn attempt.
     """
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    if not task:
-        conn.close()
-        return {"error": f"Task '{task_id}' not found"}
-    if task["status"] == "running":
-        conn.close()
-        return {"error": f"Task '{task_id}' is already running"}
-
-    plugins = json.loads(task["plugins"]) if task["plugins"] else []
-    model = task.get("model")
-    cwd = task.get("cwd")
-    channels = json.loads(task["channels"]) if task.get("channels") else []
-    kind = task.get("kind", "task")
-    host = task.get("host")
-
-    # Remote host? Forward to that host's session-bridge /spawn. The peer's
-    # daemon does the tmux + claude work and waits for registration.
-    if host and not spawner.is_self_host(host):
-        result = spawner.spawn_remote(task)
-        if not result.get("spawned"):
-            conn.close()
-            return {"error": result.get("error", "remote spawn failed")}
-        store.update_status(conn, task_id, "running")
-        store.increment_invocation(conn, task_id)
-        conn.close()
-        return {
-            "status": "running",
-            "task_id": task_id,
-            "kind": "task",
-            "host": host,
-            "remote_session_id": result.get("session_id"),
-            "tmux_session": result.get("tmux_session"),
-            "channel_healthy": True,  # peer confirmed registration before returning
-        }
-
-    # Both kind=task and kind=service route through the supervisor daemon.
-    # The daemon's reconciler is what gives services their "auto-respawn after
-    # crash" behavior — no per-task systemd unit needed. If the daemon isn't
-    # running, fall back to the in-process path so the MCP keeps working in
-    # pre-daemon environments and in tests.
-    conn.close()
-    daemon_result = _daemon_call("POST", f"/tasks/{task_id}/spawn")
-    if daemon_result is not None:
-        return daemon_result
-
-    # Daemon down — direct path. spawn_tmux works for both kinds; the kind=service
-    # auto-respawn behavior won't kick in without the daemon, but that's the same
-    # tradeoff every fallback makes.
-    conn = store.get_db()
-    try:
-        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
-    except spawner.ChannelResolutionError as e:
-        conn.close()
-        return {"error": f"channel validation failed: {e}"}
-
-    if not success:
-        conn.close()
-        return {"error": "spawn failed: tmux session could not be launched"}
-
-    store.update_status(conn, task_id, "running")
-    store.increment_invocation(conn, task_id)
-    conn.close()
-
-    spawner.send_initial_prompt(task_id, task["description"])
-
-    # The channel may still be converging (eventually-consistent via the
-    # channel.mjs heartbeat) — report its real state rather than assuming True.
-    return {
-        "status": "running",
-        "task_id": task_id,
-        "kind": kind,
-        "tmux_session": spawner.tmux_session_name(task_id),
-        "channel_healthy": spawner.channel_healthy(task_id),
-    }
+    return _daemon_call("POST", f"/tasks/{task_id}/spawn")
 
 
 @mcp.tool()
-def list_tasks(status: str | None = None) -> list[dict]:
+def list_tasks(status: str | None = None) -> list[dict] | dict:
     """List all tasks, optionally filtered by status.
 
     Args:
-        status: Filter by status (pending/running/paused/completed/killed). None for all.
+        status: Filter by status (pending/running/killed). None for all.
 
     Returns:
-        List of task records with live tmux/channel/systemd health.
+        List of task records with live tmux/channel health.
     """
     qs = f"?status={status}" if status else ""
-    daemon_result = _daemon_call("GET", f"/tasks{qs}")
-    if isinstance(daemon_result, list):
-        return daemon_result
-    if isinstance(daemon_result, dict) and "error" in daemon_result:
-        return daemon_result  # daemon up but errored — surface
-
-    # Daemon down — direct fallback.
-    conn = store.get_db()
-    tasks = store.list_tasks(conn, status)
-    conn.close()
-    for t in tasks:
-        t["tmux_alive"] = spawner.is_tmux_alive(t["task_id"])
-        t["channel_healthy"] = spawner.channel_healthy(t["task_id"])
-    return tasks
+    return _daemon_call("GET", f"/tasks{qs}")
 
 
 @mcp.tool()
@@ -255,30 +138,7 @@ def get_task(task_id: str) -> dict:
     Returns:
         Task record with state.json contents if available.
     """
-    daemon_result = _daemon_call("GET", f"/tasks/{task_id}")
-    if daemon_result is not None:
-        return daemon_result
-
-    # Daemon down — direct fallback.
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    conn.close()
-    if not task:
-        return {"error": f"Task '{task_id}' not found"}
-
-    task["tmux_alive"] = spawner.is_tmux_alive(task_id)
-    task["channel_healthy"] = spawner.channel_healthy(task_id)
-
-    state_file = spawner.task_dir(task_id) / "state.json"
-    if state_file.exists():
-        try:
-            task["state"] = json.loads(state_file.read_text())
-        except json.JSONDecodeError:
-            task["state"] = {"error": "malformed state.json"}
-    else:
-        task["state"] = None
-
-    return task
+    return _daemon_call("GET", f"/tasks/{task_id}")
 
 
 @mcp.tool()
@@ -292,42 +152,15 @@ def send_message(task_id: str, message: str) -> dict:
     Returns:
         Delivery status.
     """
-    # Route through daemon when available; fall back to direct otherwise.
-    daemon_result = _daemon_call(
+    return _daemon_call(
         "POST", f"/tasks/{task_id}/message",
         json_body={"text": message, "from_session": "taskpilot-mcp"},
     )
-    if daemon_result is not None:
-        return daemon_result
-
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    conn.close()
-    if not task:
-        return {"error": f"Task '{task_id}' not found"}
-
-    if not spawner.channel_healthy(task_id):
-        return {"error": f"Task '{task_id}' is not reachable via session-bridge"}
-
-    payload = json.dumps({"text": message, "from_session": "taskpilot-mcp"})
-    try:
-        result = subprocess.run(
-            ["curl", "-s", "-X", "POST", "-H", "Content-Type: application/json",
-             "-d", payload, f"{spawner.SESSION_BRIDGE_URL}/sessions/{task_id}/message"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return {"delivered": result.returncode == 0, "response": result.stdout}
-    except subprocess.TimeoutExpired:
-        return {"error": "Timeout sending message"}
 
 
 @mcp.tool()
 def kill_task(task_id: str) -> dict:
-    """Kill a running task — stops tmux session and cleans up channel MCP.
-
-    For kind=service, also stops and disables the systemd user service.
+    """Kill a running task — stops the tmux session and cleans up channel MCPs.
 
     Args:
         task_id: The task ID.
@@ -335,217 +168,7 @@ def kill_task(task_id: str) -> dict:
     Returns:
         Result of kill attempt.
     """
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    if not task:
-        conn.close()
-        return {"error": f"Task '{task_id}' not found"}
-
-    conn.close()
-
-    # Both kinds route through the daemon when available.
-    daemon_result = _daemon_call("POST", f"/tasks/{task_id}/kill")
-    if daemon_result is not None:
-        return daemon_result
-
-    # Daemon down — direct path.
-    conn = store.get_db()
-    tmux_killed = spawner.kill_tmux(task_id)
-    spawner.cleanup_project_mcps(task_id)
-    store.update_status(conn, task_id, "killed")
-    conn.close()
-
-    return {
-        "task_id": task_id,
-        "status": "killed",
-        "tmux_killed": tmux_killed,
-    }
-
-
-@mcp.tool()
-def get_task_log(task_id: str, lines: int = 50) -> dict:
-    """Read recent output from a task's tmux pane.
-
-    Three-tier read: live tmux pane → persisted pane.log file → error.
-    The `source` field in the response indicates which tier served the call.
-
-    Args:
-        task_id: The task ID.
-        lines: Number of lines to capture (default 50).
-
-    Returns:
-        {task_id, output, source} on success;
-        {error, hint?} on failure.
-    """
-    daemon_result = _daemon_call("GET", f"/tasks/{task_id}/log?lines={lines}")
-    if daemon_result is not None:
-        return daemon_result
-
-    # Daemon down — direct fallback. Uses the same three-tier logic.
-    session = spawner.tmux_session_name(task_id)
-    if spawner.is_tmux_alive(task_id):
-        try:
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", f"{session}:0.0", "-p"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                return {
-                    "task_id": task_id,
-                    "output": tail.tail_str(result.stdout, lines),
-                    "source": "tmux",
-                }
-        except subprocess.TimeoutExpired:
-            pass
-
-    pane_log = spawner.pane_log_path(task_id)
-    if pane_log.exists():
-        return {
-            "task_id": task_id,
-            "output": tail.tail_lines(pane_log, lines),
-            "source": "pane.log",
-        }
-
-    return {"error": "no log available", "hint": "task may have been destroyed or never ran"}
-
-
-@mcp.tool()
-def destroy_task(task_id: str) -> dict:
-    """Permanently delete a killed/completed task — removes DB row and config directory.
-
-    Only works on tasks with status 'killed' or 'completed'. Use kill_task first
-    to stop a running task.
-
-    Args:
-        task_id: The task ID to destroy.
-
-    Returns:
-        Result of the destroy attempt.
-    """
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    if not task:
-        conn.close()
-        return {"error": f"Task '{task_id}' not found"}
-    if task["status"] in ("running", "pending"):
-        conn.close()
-        return {"error": f"Task '{task_id}' is {task['status']} — kill it first"}
-
-    # Remove config directory
-    import shutil
-    td = spawner.task_dir(task_id)
-    config_removed = False
-    if td.exists():
-        shutil.rmtree(td)
-        config_removed = True
-
-    # Remove DB row
-    store.delete_task(conn, task_id)
-    conn.close()
-
-    return {
-        "task_id": task_id,
-        "destroyed": True,
-        "config_removed": config_removed,
-    }
-
-
-@mcp.tool()
-def respawn_task(task_id: str) -> dict:
-    """Respawn a killed task — resets status to pending and launches it again.
-
-    Re-uses the original task config (description, plugins, model, kind).
-    Increments invocation_count.
-
-    Args:
-        task_id: The task ID to respawn.
-
-    Returns:
-        Result of the respawn attempt (same as spawn_task).
-    """
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    if not task:
-        conn.close()
-        return {"error": f"Task '{task_id}' not found"}
-    if task["status"] == "running":
-        conn.close()
-        return {"error": f"Task '{task_id}' is already running"}
-
-    # Reset status to pending so spawn_task accepts it
-    store.update_status(conn, task_id, "pending")
-    conn.close()
-
-    # Delegate to spawn_task
-    return spawn_task(task_id)
-
-
-# ---------------------------------------------------------------------------
-# Scheduling — thin MCP wrappers; logic lives in scheduler.py
-# ---------------------------------------------------------------------------
-
-
-def _current_task_id() -> str | None:
-    """Resolve the calling agent's task id from env. None if unset."""
-    tid = os.environ.get("TASKPILOT_TASK_ID", "").strip()
-    return tid or None
-
-
-@mcp.tool()
-def schedule_task(
-    name: str,
-    plugin: str,
-    skill: str,
-    interval: str,
-    enabled: bool = True,
-) -> dict:
-    """Schedule a recurring task event via crontab.
-
-    Creates a crontab entry that POSTs a message to the agent's session-bridge
-    channel on the specified interval. The agent receives the message and
-    decides what to do.
-
-    Args:
-        name: Unique name for this schedule (e.g., "daily-research", "price-check").
-        plugin: Plugin name for context (included in the message).
-        skill: Skill or workflow to trigger (included in the message).
-        interval: Cron expression (5 fields) or human-readable ("every 30m", "daily", "hourly").
-        enabled: Whether the schedule is active (default True).
-
-    Returns:
-        Confirmation with schedule details.
-    """
-    task_id = _current_task_id()
-    if not task_id:
-        return {"error": "Cannot determine task id. Is TASKPILOT_TASK_ID set?"}
-    return scheduler.schedule(task_id, name, plugin, skill, interval, enabled)
-
-
-@mcp.tool()
-def list_scheduled_tasks() -> dict:
-    """List all scheduled tasks for the current agent."""
-    task_id = _current_task_id()
-    if not task_id:
-        return {"error": "Cannot determine task id. Is TASKPILOT_TASK_ID set?"}
-    return scheduler.list_for_task(task_id)
-
-
-@mcp.tool()
-def remove_scheduled_task(name: str) -> dict:
-    """Remove a scheduled task.
-
-    Args:
-        name: The schedule name to remove.
-
-    Returns:
-        Confirmation of removal.
-    """
-    task_id = _current_task_id()
-    if not task_id:
-        return {"error": "Cannot determine task id. Is TASKPILOT_TASK_ID set?"}
-    return scheduler.remove(task_id, name)
+    return _daemon_call("POST", f"/tasks/{task_id}/kill")
 
 
 if __name__ == "__main__":
