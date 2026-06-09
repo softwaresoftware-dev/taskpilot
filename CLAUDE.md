@@ -7,6 +7,12 @@ spawn/kill/message lifecycle. The MCP server is a thin client over that API so
 a Claude session can drive it. Agents are addressable by task id through
 session-bridge.
 
+**Role in the mindframe stack:** taskpilot is the **Agent runtime** layer. It
+spawns each agent in tmux and delivers the starter prompt and every later
+message over the **Mesh** (session-bridge `:8910/sessions/<id>/message`), never
+by typing into the pane. Callers spawn through `POST :8912/tasks/create_and_spawn`.
+It is a standalone provider; mindframe is one consumer.
+
 ## Quick Reference
 
 | Command | What it does |
@@ -20,7 +26,7 @@ session-bridge.
 - Python 3.11+, FastMCP, FastAPI, SQLite
 - tmux (session management)
 - session-bridge (message routing)
-- A single `taskpilot-daemon` boot service (systemd user unit on Linux, launchd agent on macOS)
+- A single `taskpilot-daemon` boot service, installed via the daemon capability (daemon-manager: systemd user unit on Linux, launchd agent on macOS)
 
 ## Platform support
 
@@ -39,7 +45,7 @@ the resolver accepts the install transparently.
 2. `spawn_task()` POSTs to the daemon's `/tasks/<id>/spawn`. The daemon launches Claude in a fresh tmux session via `spawner.spawn_tmux`.
 3. Claude is launched with `--name <task_id>` and `SESSION_NAME=<task_id>` exported into its env. session-bridge's `channel.mjs` reads `SESSION_NAME` (and `SESSION_NAMESPACE`) and includes them in its `/register` payload, so the mesh names the session under the task id.
 4. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
-5. External callers (e.g. a taskboard "msg" button) send messages the same way.
+5. External callers (e.g. the mindframe dashboard's message box) send messages the same way.
 
 The daemon is **reactive**: it acts on API calls, not on a background timer.
 There is no reconciler, no auto-respawn, and no completion inference. A task's
@@ -51,7 +57,16 @@ by killing it first (clears the status) then spawning again.
 
 ## Supervisor Daemon
 
-`daemon.py` runs as a boot-persistence service on port `:8912` — a systemd user unit (`taskpilot-daemon.service`) on Linux, a launchd agent (`com.softwaresoftware.taskpilot-daemon`) on macOS. It exposes:
+`daemon.py` runs as a boot-persistence service on port `:8912`. As of 0.14 the
+boot unit is **installed and managed by the daemon capability (daemon-manager
+≥ 1.5.0)**, not self-rendered: a systemd user unit (`taskpilot-daemon.service`)
+on Linux, a launchd agent (`com.claude.daemon.taskpilot-daemon`) on macOS.
+daemon-manager emits `KillMode=process` / `AbandonProcessGroup` (detached tmux
+agents survive a daemon restart) and `After=`/`Wants=session-bridge.service`
+ordering — the directives that previously forced taskpilot to self-manage.
+Registering through daemon-manager also means a plugin update auto-restarts the
+daemon onto new code (version-drift sync) instead of running stale code until a
+manual restart. It exposes:
 
 - `GET /health` — daemon status + running/total task counts
 - `GET /tasks` — list with live tmux/channel health
@@ -66,13 +81,19 @@ daemon and there is **no in-process fallback** — if the daemon is down, the
 tools return a clear "daemon is not reachable" error. The daemon is the
 service; it must be running.
 
-Install or update the boot-persistence service (systemd on Linux, launchd on macOS — auto-detected):
+Install or repair the boot-persistence service from Claude Code:
 
-```bash
-python3 daemon.py --install      # Linux: writes ~/.config/systemd/user/taskpilot-daemon.service. macOS: writes ~/Library/LaunchAgents/com.softwaresoftware.taskpilot-daemon.plist. Then enables + starts.
-python3 daemon.py --uninstall    # stop, disable, remove
-journalctl --user -u taskpilot-daemon -f
 ```
+/taskpilot:setup
+```
+
+The setup skill registers the daemon through the daemon capability
+(`daemon_start` + `daemon_install_autostart` with `kill_mode="process"`,
+`after`/`wants=["session-bridge.service"]`) and verifies `/health`. The old
+`daemon.py --install` / `--uninstall` self-render path is retired — those flags
+now just point back to `/taskpilot:setup`. For dev, run the daemon in the
+foreground with `python daemon.py`. Tail logs with
+`journalctl --user -u taskpilot-daemon -f` (Linux).
 
 ## Architecture
 

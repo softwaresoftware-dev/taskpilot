@@ -1,6 +1,6 @@
 [project]
 name = "taskpilot"
-version = "0.13.0"
+version = "0.14.0"
 description = "A local service exposing an HTTP API to spawn and manage long-running autonomous Claude Code agents"
 requires-python = ">=3.11"
 dependencies = [
