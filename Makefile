@@ -7,4 +7,7 @@ daemon:
 daemon-status:
 	@curl -sf http://127.0.0.1:8912/health && echo
 
-.PHONY: dev daemon daemon-status
+test:
+	.venv/bin/python -m pytest tests/ -q
+
+.PHONY: dev daemon daemon-status test

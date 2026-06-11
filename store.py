@@ -68,6 +68,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
             conn.commit()
 
+    # Status vocabulary migration (0.15.0): defined → running → crashed /
+    # stopped / completed. Legacy rows used 'pending' and 'killed'. Idempotent
+    # and cheap, so it runs on every open.
+    conn.execute("UPDATE tasks SET status = 'defined' WHERE status = 'pending'")
+    conn.execute("UPDATE tasks SET status = 'stopped' WHERE status = 'killed'")
+    conn.commit()
+
 
 def allocate_port(conn: sqlite3.Connection) -> int:
     """Find the next available port starting from PORT_RANGE_START."""
@@ -90,13 +97,41 @@ def create_task(
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, status, port, plugins, operating_brief, model, cwd)
+           VALUES (?, ?, ?, 'defined', ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
          json.dumps(plugins or []), json.dumps(operating_brief or {}), model, cwd),
     )
     conn.commit()
     return get_task(conn, task_id)
+
+
+def update_definition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    name: str,
+    description: str,
+    plugins: list[str] | None = None,
+    operating_brief: dict | None = None,
+    model: str | None = None,
+    cwd: str | None = None,
+) -> None:
+    """Replace a task's definition in place (PUT semantics). Status and
+    invocation history are untouched."""
+    conn.execute(
+        """UPDATE tasks SET name = ?, description = ?, plugins = ?,
+           operating_brief = ?, model = ?, cwd = ?, updated_at = datetime('now')
+           WHERE task_id = ?""",
+        (name, description, json.dumps(plugins or []),
+         json.dumps(operating_brief or {}), model, cwd, task_id),
+    )
+    conn.commit()
+
+
+def delete_task(conn: sqlite3.Connection, task_id: str) -> None:
+    """Delete a task row, freeing its id for reuse."""
+    conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+    conn.commit()
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> dict | None:

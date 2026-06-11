@@ -3,14 +3,15 @@
 A local service that exposes an HTTP API for running long-running autonomous
 Claude Code agents. The `taskpilot-daemon` is the product: a boot-persistent
 process on `:8912` that spawns each agent in its own tmux session and owns its
-spawn/kill/message lifecycle. The MCP server is a thin client over that API so
-a Claude session can drive it. Agents are addressable by task id through
-session-bridge.
+define/start/stop/message lifecycle. The MCP server is a pure client over that
+API so a Claude session can drive it. Agents are addressable by task id
+through session-bridge.
 
 **Role in the mindframe stack:** taskpilot is the **Agent runtime** layer. It
 spawns each agent in tmux and delivers the starter prompt and every later
 message over the **Mesh** (session-bridge `:8910/sessions/<id>/message`), never
-by typing into the pane. Callers spawn through `POST :8912/tasks/create_and_spawn`.
+by typing into the pane. Callers define with `PUT :8912/tasks/<id>` and launch
+with `POST :8912/tasks/<id>/start`.
 It is a standalone provider; mindframe is one consumer.
 
 ## Quick Reference
@@ -41,19 +42,22 @@ the resolver accepts the install transparently.
 
 ## How It Works
 
-1. `define_task()` writes config to `~/.taskpilot/<id>/` and a row to the DB. This is the one MCP call that runs in-process — everything else goes through the daemon.
-2. `spawn_task()` POSTs to the daemon's `/tasks/<id>/spawn`. The daemon launches Claude in a fresh tmux session via `spawner.spawn_tmux`.
+1. `define_task()` PUTs the task definition to the daemon (`PUT /tasks/<id>`), which writes config to `~/.taskpilot/<id>/` and a row to the DB. Idempotent — redefining updates in place.
+2. `spawn_task()` POSTs to the daemon's `/tasks/<id>/start`. The daemon launches Claude in a fresh tmux session via `spawner.spawn_tmux` — unless it's already running, in which case it's a no-op (`already_running: true`).
 3. Claude is launched with `--name <task_id>` and `SESSION_NAME=<task_id>` exported into its env. session-bridge's `channel.mjs` reads `SESSION_NAME` (and `SESSION_NAMESPACE`) and includes them in its `/register` payload, so the mesh names the session under the task id.
-4. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
-5. External callers (e.g. the mindframe dashboard's message box) send messages the same way.
+4. The starter prompt — `start`'s optional `prompt` override, else the stored description — is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
+5. External callers (e.g. the mindframe dashboard's message box) send messages the same way, via `POST /tasks/<id>/message`.
 
 The daemon is **reactive**: it acts on API calls, not on a background timer.
-There is no reconciler, no auto-respawn, and no completion inference. A task's
-status reflects the last lifecycle call (`pending` → `running` → `killed`).
-Liveness (is the agent's tmux still alive) is computed on demand whenever a
-task is listed or fetched (`tmux_alive`, `channel_healthy`). A task whose tmux
-has died still shows `status: running` with `tmux_alive: false` — re-launch it
-by killing it first (clears the status) then spawning again.
+There is no background reconciler and no completion inference — but every
+*read* reconciles a task's stored status against tmux ground truth and
+persists the correction: a `running` row whose tmux died reads as `crashed`;
+a `stopped`/`crashed` row whose tmux is somehow alive reads as `running`.
+Status vocabulary: `defined → running → crashed | stopped | completed`.
+Reviving a dead task is one call — `POST /tasks/<id>/start` (optionally with a
+resume-flavored `prompt`). The lifecycle verbs are convergent and retry-safe:
+start = ensure running, stop = ensure stopped, DELETE = stop + forget (frees
+the id for reuse).
 
 ## Supervisor Daemon
 
@@ -69,12 +73,14 @@ daemon onto new code (version-drift sync) instead of running stale code until a
 manual restart. It exposes:
 
 - `GET /health` — daemon status + running/total task counts
-- `GET /tasks` — list with live tmux/channel health
+- `GET /tasks[?status=]` — list with reconciled status + live tmux/channel health
 - `GET /tasks/<id>` — task detail + state.json
-- `POST /tasks/<id>/spawn` — launch via `spawner.spawn_tmux`, send initial prompt, flip status to running
-- `POST /tasks/<id>/kill` — kill tmux, clean project MCPs, flip status to killed
-- `POST /tasks/<id>/message` — proxy to session-bridge
-- `POST /tasks/create_and_spawn` — define + spawn in one call, for event-driven callers (e.g. the dispatcher's `spawn:<recipe>` path) that hold no prior task row. Body: `{description, name?, cwd?, model?, brief?}`. The task_id is slugified from `name` (or the description); idempotent for a caller that predicts the id. No MCP-tool equivalent — HTTP only.
+- `PUT /tasks/<id>` — upsert the task definition `{description, name?, cwd?, model?, brief?, plugins?}`; the id is a caller-chosen slug
+- `POST /tasks/<id>/start` — ensure running (idempotent): no-op if alive, (re)spawn if dead; optional `{prompt}` overrides the starter prompt for this start
+- `POST /tasks/<id>/stop` — ensure stopped (idempotent): kill tmux, clean project MCPs
+- `POST /tasks/<id>/message` — deliver via session-bridge with **verified delivery**; errors carry `detail.code`: 409 `agent_not_running` (start + retry), 503 `channel_not_ready` (retry shortly), 502 `delivery_failed`
+- `DELETE /tasks/<id>` — stop + delete row + config dir; frees the id (idempotent)
+- Deprecated aliases (one release): `POST /tasks/<id>/spawn` → start, `POST /tasks/<id>/kill` → stop, `POST /tasks/create_and_spawn` → PUT + start in one round trip for event-driven callers (the dispatcher's `spawn:<recipe>` path). The task_id is slugified from `name` (or the description); now genuinely idempotent — re-posting updates the definition and ensures running instead of 409ing.
 
 The MCP server (`server.py`) is a thin client: `_daemon_call()` POSTs to the
 daemon and there is **no in-process fallback** — if the daemon is down, the
@@ -126,11 +132,11 @@ python daemon.py                # run supervisor daemon (foreground; --install t
 make daemon-status              # curl the daemon's /health
 ```
 
-There is no automated test suite — it was retired with the feature pare-down.
-Sanity-check a change by importing the modules
-(`uv run python -c "import store, spawner, server, daemon"`) and, for the spawn
-path, doing a real `define_task` → `spawn_task` → `send_message` → `kill_task`
-against a running daemon + session-bridge.
+`make test` runs the daemon API contract tests (`tests/test_daemon_api.py`) —
+hermetic, with a fake spawner; they pin the idempotency and
+status-reconciliation invariants. For the real spawn path, sanity-check
+against a running daemon + session-bridge with `define_task` → `spawn_task` →
+`send_message` → `kill_task`.
 
 Install as plugin:
 ```bash
@@ -139,12 +145,13 @@ claude --plugin-dir /home/thatcher/projects/softwaresoftware/projects/plugins/pr
 
 ## MCP Tools
 
-- `define_task(name, description, plugins?, operating_brief?, model?, cwd?)` — write task config + allocate port (does not launch). `plugins` is a list of dev-mode `--plugin-dir` paths, only for plugins NOT already installed (installed ones are inherited). Runs in-process (writes the DB row + config files).
-- `spawn_task(task_id)` — launch tmux session via the daemon (~16s startup)
-- `list_tasks(status?)` — list all tasks with live health
+- `define_task(name, description, plugins?, operating_brief?, model?, cwd?)` — upsert the task definition via `PUT /tasks/<slug(name)>` (does not launch). `plugins` is a list of dev-mode `--plugin-dir` paths, only for plugins NOT already installed (installed ones are inherited).
+- `spawn_task(task_id, prompt?)` — ensure the agent is running via `/start` (~16s when it actually spawns; no-op if alive). `prompt` overrides the starter prompt — pass a resume-flavored one when reviving.
+- `list_tasks(status?)` — list all tasks with reconciled status + live health
 - `get_task(task_id)` — full detail + state.json
-- `send_message(task_id, message)` — POST to channel via the daemon
-- `kill_task(task_id)` — kill tmux + clean up via the daemon
+- `send_message(task_id, message)` — verified delivery via the daemon; on `agent_not_running`, spawn_task then resend
+- `kill_task(task_id)` — ensure stopped via `/stop` (row survives; spawn_task relaunches later)
+- `delete_task(task_id)` — stop + delete entirely, freeing the id for reuse
 
 To watch an agent's live output, `tmux attach -t <task_id>`.
 
@@ -176,9 +183,8 @@ it lived in git history before v0.13.0:
 
 - **Scheduling / cron** — no `schedule_task` family. Drive recurrence from an external scheduler that POSTs a message to the agent's channel.
 - **Remote / mesh spawn** — no `host=` forwarding. The service runs agents on its own machine only.
-- **`kind=service` + auto-respawn** — every task is one-shot. No reconciler brings a dead agent back.
-- **Idle dormancy / resume-on-wake** — no lifecycle hooks, no `--resume` wake path.
+- **`kind=service` + auto-respawn** — every task is one-shot. No *background* reconciler brings a dead agent back on its own; revival is caller-driven (`POST /tasks/<id>/start` is idempotent and respawns a crashed task), and status is reconciled against tmux truth on every read.
+- **Idle dormancy / resume-on-wake** — no lifecycle hooks, no `--resume` wake path. A revived agent starts a fresh claude session; continuity comes from the starter `prompt` the reviver passes and whatever state the agent persisted (state.json, its cwd files).
 - **Log reads** — no `get_task_log` tool and no `pane.log`. To watch an agent, `tmux attach -t <task_id>`.
 - **Capability → plugin resolution** — `capabilities` in the brief are doc nudges only; installed plugins/MCPs come from the inherited `~/.claude`. No runtime softwaresoftware dependency.
 - **Extra dev channels** — the agent gets exactly one channel (session-bridge). No `channels` param, no channel-resolution validation.
-- **`destroy_task` / `respawn_task`** — kill is the only teardown. (Note: a killed task's DB row persists, so re-creating a task with the same name returns an "already exists" error. Pick a new name, or clear the row from `~/.taskpilot/taskpilot.db`.)

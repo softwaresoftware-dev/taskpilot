@@ -1,10 +1,10 @@
 """MCP server for taskpilot — task lifecycle and messaging.
 
-A thin client over the taskpilot supervisor daemon (daemon.py). `define_task`
-writes config + a DB row locally; every lifecycle call (spawn/kill/message,
-plus the reads) goes through the daemon's HTTP API. The daemon is the service
-that actually owns running agents, so it must be up — if it's unreachable the
-tools return a clear error rather than silently doing the work in-process.
+A pure client over the taskpilot supervisor daemon (daemon.py). Every tool —
+including define_task, which used to write the DB in-process — goes through
+the daemon's HTTP API. The daemon is the service that owns running agents, so
+it must be up; if it's unreachable the tools return a clear error rather than
+silently doing the work in-process.
 """
 
 import json
@@ -15,7 +15,6 @@ import urllib.request
 from mcp.server.fastmcp import FastMCP
 
 import spawner
-import store
 
 mcp = FastMCP("taskpilot")
 
@@ -47,7 +46,7 @@ def _daemon_call(method: str, path: str, json_body: dict | None = None) -> dict 
     except urllib.error.URLError:
         return {
             "error": f"taskpilot daemon is not reachable at {DAEMON_URL}. "
-            "Start it with `python daemon.py` (or install it: `python daemon.py --install`)."
+            "Install/repair it with /taskpilot:setup (or run `python daemon.py` for dev)."
         }
 
 
@@ -60,13 +59,17 @@ def define_task(
     model: str | None = None,
     cwd: str | None = None,
 ) -> dict:
-    """Define a new autonomous task. Writes config files and allocates a channel port.
+    """Define (or redefine) an autonomous task. Idempotent — defining an
+    existing task updates its definition in place; the new definition applies
+    from the next spawn.
 
     This only defines the task — call spawn_task(task_id) to launch it.
 
     Args:
-        name: Human-readable task name (e.g., "Sell my lawnmower").
-        description: Full task description — what the agent should do.
+        name: Human-readable task name (e.g., "Sell my lawnmower"). The
+            task_id is this name slugified.
+        description: Full task description — what the agent should do. Also
+            the default starter prompt sent when the task spawns.
         plugins: Optional list of plugin directory paths to load as dev-mode
             --plugin-dir flags. Only needed for plugins NOT already installed —
             the agent inherits the user's full ~/.claude (all installed plugins
@@ -78,51 +81,55 @@ def define_task(
             boundaries (list[str]): What NOT to do.
             capabilities (list[str]): Capabilities to remind the agent it has
                 (e.g. ["memory"]). These become guidance sections in the
-                agent's CLAUDE.md — the tools themselves come from the inherited
-                environment, so nothing is resolved or installed here.
+                agent's CLAUDE.md.
         model: Optional Claude model to use (e.g., "sonnet", "opus", "haiku").
         cwd: Optional working directory for the task (default: ~/.taskpilot/<task_id>/).
 
     Returns:
-        Task record with task_id, port, and status.
+        Task record with task_id and a `created` flag (false = updated).
     """
     task_id = spawner.slugify(name)
-    plugins = plugins or []
-    operating_brief = operating_brief or {}
-
-    with store.db() as conn:
-        existing = store.get_task(conn, task_id)
-        if existing:
-            return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
-        task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd)
-
-    spawner.write_task_config(task_id, name, description, plugins, operating_brief)
-
-    return task
+    return _daemon_call("PUT", f"/tasks/{task_id}", json_body={
+        "name": name,
+        "description": description,
+        "plugins": plugins,
+        "brief": operating_brief,
+        "model": model,
+        "cwd": cwd,
+    })
 
 
 @mcp.tool()
-def spawn_task(task_id: str) -> dict:
-    """Launch a created task in a tmux session with its channel (~16s startup).
+def spawn_task(task_id: str, prompt: str | None = None) -> dict:
+    """Ensure a task's agent is running (~16s startup when it actually
+    spawns). Idempotent: a task that's already running is a no-op; a crashed
+    or stopped one is respawned.
 
     Args:
         task_id: The task ID returned by define_task.
+        prompt: Optional starter prompt override for this spawn only. By
+            default the task's stored description is sent. Pass a
+            resume-flavored prompt when reviving an agent that already has
+            work in progress.
 
     Returns:
-        Status of the spawn attempt.
+        {status, started, already_running, prompt_delivered?, ...}.
     """
-    return _daemon_call("POST", f"/tasks/{task_id}/spawn")
+    body = {"prompt": prompt} if prompt is not None else {}
+    return _daemon_call("POST", f"/tasks/{task_id}/start", json_body=body)
 
 
 @mcp.tool()
 def list_tasks(status: str | None = None) -> list[dict] | dict:
-    """List all tasks, optionally filtered by status.
+    """List all tasks with reconciled status and live health.
 
     Args:
-        status: Filter by status (pending/running/killed). None for all.
+        status: Filter by status (defined/running/crashed/stopped/completed).
+            None for all. Statuses are reconciled against tmux ground truth
+            before filtering, so 'running' means actually running.
 
     Returns:
-        List of task records with live tmux/channel health.
+        List of task records with tmux_alive/channel_healthy.
     """
     qs = f"?status={status}" if status else ""
     return _daemon_call("GET", f"/tasks{qs}")
@@ -136,21 +143,25 @@ def get_task(task_id: str) -> dict:
         task_id: The task ID.
 
     Returns:
-        Task record with state.json contents if available.
+        Task record with reconciled status, live health, and state.json.
     """
     return _daemon_call("GET", f"/tasks/{task_id}")
 
 
 @mcp.tool()
 def send_message(task_id: str, message: str) -> dict:
-    """Send a message to a running task via its channel.
+    """Send a message to a running task, with verified delivery.
+
+    Errors are actionable: `agent_not_running` means the agent is dead —
+    spawn_task(task_id) revives it (pass a resume-flavored prompt), then
+    resend. `channel_not_ready` means it's still booting — retry shortly.
 
     Args:
         task_id: The task ID.
         message: The message to send.
 
     Returns:
-        Delivery status.
+        {delivered: true} on success, {"error": {code, message}} otherwise.
     """
     return _daemon_call(
         "POST", f"/tasks/{task_id}/message",
@@ -160,15 +171,31 @@ def send_message(task_id: str, message: str) -> dict:
 
 @mcp.tool()
 def kill_task(task_id: str) -> dict:
-    """Kill a running task — stops the tmux session and cleans up channel MCPs.
+    """Stop a task's agent — kills the tmux session and cleans up project
+    MCPs. Idempotent: stopping an already-dead task is a no-op. The task row
+    survives, so spawn_task(task_id) can relaunch it later.
 
     Args:
         task_id: The task ID.
 
     Returns:
-        Result of kill attempt.
+        {status, tmux_killed}.
     """
-    return _daemon_call("POST", f"/tasks/{task_id}/kill")
+    return _daemon_call("POST", f"/tasks/{task_id}/stop")
+
+
+@mcp.tool()
+def delete_task(task_id: str) -> dict:
+    """Stop a task and delete it entirely — DB row and config dir — freeing
+    the task id for reuse. Idempotent: deleting an absent task is a no-op.
+
+    Args:
+        task_id: The task ID.
+
+    Returns:
+        {deleted, existed}.
+    """
+    return _daemon_call("DELETE", f"/tasks/{task_id}")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,53 @@
 
 All notable changes to taskpilot.
 
+## 0.15.0 — 2026-06-11
+
+API rearchitecture: resource-oriented, idempotent, truth-telling. The old API
+made dead agents permanent — a crashed task read as `running` forever, `spawn`
+409'd on it (status said running), and `create_and_spawn` 409'd on any
+existing row, so a name could never be reused. Consumers (e.g. the mindframe
+surface) had no revive path at all.
+
+### Changed
+
+- **Definition is a resource: `PUT /tasks/{id}`** (upsert, caller-chosen slug
+  id). Redefining updates in place. The MCP `define_task` tool routes through
+  this — the MCP server is now a pure daemon client with no in-process DB
+  writes.
+- **`POST /tasks/{id}/start` / `POST /tasks/{id}/stop`** replace spawn/kill
+  as convergent verbs: start = "ensure running" (no-op if alive, respawn if
+  crashed/stopped), stop = "ensure stopped" (no-op if dead). Both retry-safe.
+  `start` takes an optional `{prompt}` override so revivers can send a
+  resume-flavored starter instead of replaying the original description.
+  Per-task locks serialize concurrent lifecycle calls.
+- **Status tells the truth.** Every read reconciles the stored status against
+  tmux ground truth and persists the correction: `running` + dead tmux →
+  `crashed`; `stopped`/`crashed` + live tmux → `running`. Status vocabulary
+  is now `defined → running → crashed | stopped | completed`; legacy
+  `pending`/`killed` rows migrate on open.
+- **`POST /tasks/{id}/message` verifies delivery.** Machine-readable errors:
+  409 `agent_not_running` (caller may start + retry), 503 `channel_not_ready`
+  (booting; retry shortly), 502 `delivery_failed`. No more
+  `200 {"delivered": false}`.
+- `GET /tasks?status=` filters on the reconciled status.
+
+### Added
+
+- **`DELETE /tasks/{id}`** — stop + delete row + config dir, freeing the id
+  for reuse (the old model locked a name forever once used). Exposed as the
+  `delete_task` MCP tool.
+- `spawn_task` MCP tool gained an optional `prompt` override.
+- Daemon API contract tests (`tests/test_daemon_api.py`, fake spawner — no
+  tmux/bridge needed) + `make test`.
+
+### Deprecated (kept for one release)
+
+- `POST /tasks/{id}/spawn` → start, `POST /tasks/{id}/kill` → stop,
+  `POST /tasks/create_and_spawn` → PUT + start (now idempotent: re-posting
+  updates the definition and ensures running instead of 409ing; an
+  already-running agent is not re-prompted).
+
 ## 0.13.0 — 2026-06-05
 
 Major pare-down to the irreducible core: a local service exposing an HTTP API

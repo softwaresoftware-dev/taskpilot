@@ -1,20 +1,46 @@
 #!/usr/bin/env python3
 """Taskpilot supervisor daemon.
 
-A long-lived local service that owns the spawn/kill/message lifecycle for
-tasks and exposes it over an HTTP API on :8912. The MCP server (server.py)
+A long-lived local service that owns the define/start/stop/message lifecycle
+for tasks and exposes it over an HTTP API on :8912. The MCP server (server.py)
 is a thin client over this daemon.
+
+The API is resource-oriented and idempotent:
+
+  - A task's *definition* (name, description, cwd, model, brief) is a resource
+    you PUT. PUT twice is safe; the second call updates in place.
+  - A task's *runtime* (is its tmux alive, is its channel registered) is
+    observed ground truth, reported on every read and never assumed from the
+    last lifecycle call. Reads reconcile the stored status against tmux: a
+    "running" row whose tmux died reads (and persists) as "crashed"; a
+    "stopped"/"crashed" row whose tmux is actually alive reads as "running".
+  - start/stop are convergent verbs: "ensure running" / "ensure stopped".
+    Calling start on a live task is a 200 no-op; calling start on a crashed
+    task respawns it. Retrying either is always safe.
+  - /message verifies delivery end-to-end: 409 when the agent is not running
+    (callers can react by calling start), 503 when the agent is up but its
+    channel hasn't registered yet (retryable), 502 when the channel POST
+    failed. A 200 means session-bridge accepted the message for this agent.
+  - DELETE stops the task and frees its id for reuse.
+
+Status values: defined → running → (crashed | stopped | completed). Legacy
+rows ('pending', 'killed') are migrated on open by store._ensure_schema.
+
+Deprecated aliases kept for one release (old consumers: dispatcher,
+crestborne, cool-af, voice-lab): POST /tasks/{id}/spawn → start,
+POST /tasks/{id}/kill → stop, POST /tasks/create_and_spawn → PUT + start.
 
 The daemon installs as a boot-persistence service through the daemon
 capability (daemon-manager); see `skills/setup/SKILL.md`. It is reactive:
-it acts on API calls, not on a background timer. Liveness (is the agent's
-tmux still alive) is reported on-demand when a task is listed or fetched.
+it acts on API calls, not on a background timer.
 """
 
 import json
 import logging
 import os
+import shutil
 import sys
+import threading
 from pathlib import Path
 
 import uvicorn
@@ -27,6 +53,7 @@ import spawner
 import store
 
 DEFAULT_PORT = 8912
+VERSION = "0.15.0"
 
 log = logging.getLogger("taskpilot.daemon")
 
@@ -41,15 +68,33 @@ class HealthResponse(BaseModel):
     total: int
 
 
+class TaskDefinition(BaseModel):
+    """The desired definition of a task — the body of PUT /tasks/{id}."""
+    description: str
+    name: str | None = None
+    cwd: str | None = None
+    model: str | None = None
+    brief: dict | None = None
+    plugins: list[str] | None = None
+
+
+class StartRequest(BaseModel):
+    """Optional start parameters. `prompt` overrides the starter prompt for
+    this start only (the stored description is the default). A reviver
+    (e.g. the mindframe dashboard respawning a frame agent) passes a
+    resume-flavored prompt here so the agent doesn't redo its first turn."""
+    prompt: str | None = None
+
+
 class MessageRequest(BaseModel):
     text: str
     from_session: str | None = None
 
 
 class CreateSpawnRequest(BaseModel):
-    """One-shot create-and-spawn for event-driven callers (e.g. dispatcher)
-    that have no prior task row. Collapses the MCP define_task + spawn_task
-    pair into a single HTTP round-trip."""
+    """Deprecated composite (PUT + start) for callers that want one round
+    trip (the dispatcher's `spawn:<recipe>` path). Now idempotent: an
+    existing task is updated and ensured running instead of 409ing."""
     description: str
     name: str | None = None
     cwd: str | None = None
@@ -60,28 +105,59 @@ class CreateSpawnRequest(BaseModel):
 app = FastAPI(title="taskpilot-daemon")
 
 
-# --- Read endpoints ---
+# --- Per-task locking ---
+#
+# start/stop/delete mutate tmux + the DB row; two concurrent starts for the
+# same task must not race into a double spawn. Endpoints run in FastAPI's
+# threadpool, so a plain threading.Lock per task id is enough.
+
+_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
 
 
-@app.get("/health")
-def health() -> HealthResponse:
-    """Daemon health + how many tasks are marked running."""
+def _task_lock(task_id: str) -> threading.Lock:
+    with _locks_guard:
+        return _locks.setdefault(task_id, threading.Lock())
+
+
+# --- Helpers ---
+
+
+def _get_or_404(task_id: str) -> dict:
     with store.db() as conn:
-        running = store.list_tasks(conn, "running")
-        everything = store.list_tasks(conn)
-    return HealthResponse(
-        ok=True,
-        version="0.1.0",
-        running=len(running),
-        total=len(everything),
-    )
+        task = store.get_task(conn, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
+    return task
+
+
+def _reconcile(task: dict) -> dict:
+    """Make the stored status agree with tmux ground truth. Mutates and
+    returns the task dict; persists any correction.
+
+      running + dead tmux  -> crashed   (the agent died; nothing noticed)
+      stopped/crashed + live tmux -> running  (an external kill failed, or a
+                                               stop raced a spawn)
+    """
+    alive = spawner.is_tmux_alive(task["task_id"])
+    status = task["status"]
+    corrected = None
+    if status == "running" and not alive:
+        corrected = "crashed"
+    elif status in ("stopped", "crashed") and alive:
+        corrected = "running"
+    if corrected:
+        with store.db() as conn:
+            store.update_status(conn, task["task_id"], corrected)
+        task["status"] = corrected
+    task["tmux_alive"] = alive
+    return task
 
 
 def _enrich(task: dict) -> dict:
-    """Add live health fields to a task row. Mutates and returns."""
-    tid = task["task_id"]
-    task["tmux_alive"] = spawner.is_tmux_alive(tid)
-    task["channel_healthy"] = spawner.channel_healthy(tid)
+    """Reconcile status with ground truth and add live health fields."""
+    _reconcile(task)
+    task["channel_healthy"] = spawner.channel_healthy(task["task_id"])
     return task
 
 
@@ -96,21 +172,142 @@ def _read_state(task_id: str) -> dict | None:
         return {"error": "malformed state.json"}
 
 
+def _upsert(task_id: str, body: TaskDefinition) -> tuple[dict, bool]:
+    """Create or update a task definition row + its config files.
+    Returns (task, created)."""
+    name = body.name or body.description[:80]
+    with store.db() as conn:
+        existing = store.get_task(conn, task_id)
+        if existing:
+            store.update_definition(
+                conn, task_id, name=name, description=body.description,
+                plugins=body.plugins, operating_brief=body.brief,
+                model=body.model, cwd=body.cwd,
+            )
+            task = store.get_task(conn, task_id)
+            created = False
+        else:
+            task = store.create_task(
+                conn, task_id, name, body.description,
+                body.plugins or [], body.brief or {}, body.model, body.cwd,
+            )
+            created = True
+    spawner.write_task_config(task_id, name, body.description,
+                              body.plugins or [], body.brief or {})
+    return task, created
+
+
+def _start(task_id: str, prompt: str | None) -> dict:
+    """Ensure the task's agent is running. Idempotent: a live agent is a
+    no-op; a dead/never-started one is (re)spawned and sent its starter
+    prompt — `prompt` if given, else the stored description."""
+    task = _get_or_404(task_id)
+
+    with _task_lock(task_id):
+        if spawner.is_tmux_alive(task_id):
+            with store.db() as conn:
+                store.update_status(conn, task_id, "running")
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "status": "running",
+                "started": False,
+                "already_running": True,
+                "tmux_session": spawner.tmux_session_name(task_id),
+                "channel_healthy": spawner.channel_healthy(task_id),
+            }
+
+        # Clear any half-dead session state before respawning (a dead tmux
+        # can't be present here, but a name-squatting zombie pane can).
+        spawner.kill_tmux(task_id)
+
+        # spawn_tmux blocks ~16s — that's fine, we hold only this task's lock.
+        plugins = json.loads(task["plugins"]) if task["plugins"] else []
+        success = spawner.spawn_tmux(
+            task_id, plugins, model=task.get("model"), cwd=task.get("cwd"),
+        )
+        if not success:
+            raise HTTPException(
+                status_code=502,
+                detail=f"start failed for {task_id}: tmux session could not be launched",
+            )
+
+        with store.db() as conn:
+            store.update_status(conn, task_id, "running")
+            store.increment_invocation(conn, task_id)
+
+        starter = prompt if prompt is not None else task["description"]
+        prompt_delivered = spawner.send_initial_prompt(task_id, starter)
+        if not prompt_delivered:
+            log.warning("start %s: agent up but starter prompt was not delivered", task_id)
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "status": "running",
+        "started": True,
+        "already_running": False,
+        "prompt_delivered": prompt_delivered,
+        "tmux_session": spawner.tmux_session_name(task_id),
+        "channel_healthy": spawner.channel_healthy(task_id),
+    }
+
+
+def _stop(task_id: str) -> dict:
+    """Ensure the task's agent is stopped. Idempotent — stopping a dead or
+    never-started task is a 200 no-op."""
+    task = _get_or_404(task_id)
+    with _task_lock(task_id):
+        tmux_killed = spawner.kill_tmux(task_id)
+        spawner.cleanup_project_mcps(task_id)
+        # Only a task that has actually run becomes "stopped"; a defined or
+        # completed row keeps its status.
+        new_status = task["status"]
+        if task["status"] in ("running", "crashed"):
+            new_status = "stopped"
+            with store.db() as conn:
+                store.update_status(conn, task_id, "stopped")
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "status": new_status,
+        "tmux_killed": tmux_killed,
+    }
+
+
+# --- Read endpoints ---
+
+
+@app.get("/health")
+def health() -> HealthResponse:
+    """Daemon health + how many tasks are marked running."""
+    with store.db() as conn:
+        running = store.list_tasks(conn, "running")
+        everything = store.list_tasks(conn)
+    return HealthResponse(
+        ok=True,
+        version=VERSION,
+        running=len(running),
+        total=len(everything),
+    )
+
+
 @app.get("/tasks")
 def list_tasks(status: str | None = None) -> list[dict]:
-    """List tasks with live health. Optional ?status= filter."""
+    """List tasks with reconciled status + live health. Optional ?status=
+    filter (applied after reconciliation, so it filters on the truth)."""
     with store.db() as conn:
-        tasks = store.list_tasks(conn, status)
-    return [_enrich(t) for t in tasks]
+        tasks = store.list_tasks(conn)
+    enriched = [_enrich(t) for t in tasks]
+    if status:
+        enriched = [t for t in enriched if t["status"] == status]
+    return enriched
 
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str) -> dict:
-    """Full task detail with live health and state.json."""
-    with store.db() as conn:
-        task = store.get_task(conn, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
+    """Full task detail with reconciled status, live health, and state.json."""
+    task = _get_or_404(task_id)
     _enrich(task)
     task["state"] = _read_state(task_id)
     return task
@@ -119,125 +316,124 @@ def get_task(task_id: str) -> dict:
 # --- Write endpoints ---
 
 
-@app.post("/tasks/{task_id}/spawn")
-def spawn(task_id: str) -> dict:
-    """Spawn a task in tmux."""
-    with store.db() as conn:
-        task = store.get_task(conn, task_id)
-        if not task:
-            raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
-        if task["status"] == "running":
-            raise HTTPException(status_code=409, detail=f"task '{task_id}' is already running")
-
-    # spawn_tmux blocks ~16s — do it outside any open DB connection.
-    plugins = json.loads(task["plugins"]) if task["plugins"] else []
-    success = spawner.spawn_tmux(
-        task_id, plugins, model=task.get("model"), cwd=task.get("cwd"),
-    )
-    if not success:
-        raise HTTPException(status_code=502, detail=f"spawn failed for {task_id}: tmux session could not be launched")
-
-    with store.db() as conn:
-        store.update_status(conn, task_id, "running")
-        store.increment_invocation(conn, task_id)
-
-    spawner.send_initial_prompt(task_id, task["description"])
-
-    return {
-        "status": "running",
-        "task_id": task_id,
-        "tmux_session": spawner.tmux_session_name(task_id),
-        "channel_healthy": spawner.channel_healthy(task_id),
-    }
-
-
-@app.post("/tasks/create_and_spawn")
-def create_and_spawn(body: CreateSpawnRequest) -> dict:
-    """Create a task and immediately spawn it in one call.
-
-    Mirrors the MCP `define_task` + `spawn_task` pair for callers that don't
-    hold a prior task row (the dispatcher's `spawn:<recipe>` path). The task_id
-    is slugified from `name` (or the description) — passing an already-slugged
-    name is idempotent, so callers that predict the task_id locally get the
-    same value back.
-    """
-    name = body.name or body.description[:80]
-    task_id = spawner.slugify(name)
-
-    with store.db() as conn:
-        existing = store.get_task(conn, task_id)
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail=f"task '{task_id}' already exists with status '{existing['status']}'",
-            )
-        store.create_task(
-            conn, task_id, name, body.description,
-            None, body.brief or {}, body.model, body.cwd,
-        )
-    spawner.write_task_config(task_id, name, body.description, [], body.brief or {})
-
-    # spawn_tmux blocks ~16s — do it outside any open DB connection.
-    success = spawner.spawn_tmux(
-        task_id, [], model=body.model, cwd=body.cwd,
-    )
-    if not success:
+@app.put("/tasks/{task_id}")
+def put_task(task_id: str, body: TaskDefinition) -> dict:
+    """Create or update a task definition. Idempotent — the task id is the
+    caller-chosen identity; PUTting it again updates the definition in place
+    (a running agent is not re-prompted; the new definition applies from the
+    next start)."""
+    if spawner.slugify(task_id) != task_id or not task_id:
         raise HTTPException(
-            status_code=502,
-            detail=f"spawn failed for {task_id}: tmux session could not be launched",
+            status_code=422,
+            detail=f"task id '{task_id}' must be a slug ([a-z0-9-], max 50 chars)",
         )
-
-    with store.db() as conn:
-        store.update_status(conn, task_id, "running")
-        store.increment_invocation(conn, task_id)
-
-    spawner.send_initial_prompt(task_id, body.description)
-
-    return {
-        "ok": True,
-        "status": "running",
-        "task_id": task_id,
-        "tmux_session": spawner.tmux_session_name(task_id),
-        "channel_healthy": spawner.channel_healthy(task_id),
-    }
+    task, created = _upsert(task_id, body)
+    task["created"] = created
+    return task
 
 
-@app.post("/tasks/{task_id}/kill")
-def kill(task_id: str) -> dict:
-    """Kill a running task — stop its tmux session and clean up project MCPs."""
+@app.post("/tasks/{task_id}/start")
+def start(task_id: str, body: StartRequest | None = None) -> dict:
+    """Ensure the task's agent is running (idempotent). Optional body
+    {prompt} overrides the starter prompt for this start."""
+    return _start(task_id, body.prompt if body else None)
+
+
+@app.post("/tasks/{task_id}/stop")
+def stop(task_id: str) -> dict:
+    """Ensure the task's agent is stopped (idempotent)."""
+    return _stop(task_id)
+
+
+@app.delete("/tasks/{task_id}")
+def delete_task(task_id: str) -> dict:
+    """Stop the task and delete it — row, config dir, and all. Frees the id
+    for reuse. Idempotent: deleting an absent task is a 200 no-op."""
     with store.db() as conn:
         task = store.get_task(conn, task_id)
-        if not task:
-            raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
-        tmux_killed = spawner.kill_tmux(task_id)
+    if not task:
+        return {"ok": True, "task_id": task_id, "deleted": False, "existed": False}
+    with _task_lock(task_id):
+        spawner.kill_tmux(task_id)
         spawner.cleanup_project_mcps(task_id)
-        store.update_status(conn, task_id, "killed")
-
-    return {
-        "task_id": task_id,
-        "status": "killed",
-        "tmux_killed": tmux_killed,
-    }
+        with store.db() as conn:
+            store.delete_task(conn, task_id)
+        shutil.rmtree(spawner.task_dir(task_id), ignore_errors=True)
+    return {"ok": True, "task_id": task_id, "deleted": True, "existed": True}
 
 
 @app.post("/tasks/{task_id}/message")
 def message(task_id: str, body: MessageRequest) -> dict:
-    """Forward a message to a running task via session-bridge."""
-    with store.db() as conn:
-        task = store.get_task(conn, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
+    """Deliver a message to a running task via session-bridge, verifying
+    delivery. Error contract (machine-readable `detail.code`):
 
+      409 agent_not_running — tmux is dead; caller may POST /start and retry
+      503 channel_not_ready — agent alive but channel unregistered; retry soon
+      502 delivery_failed   — session-bridge rejected/failed the forward
+    """
+    task = _get_or_404(task_id)
+    _reconcile(task)
+
+    if not task["tmux_alive"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "agent_not_running",
+                "task_status": task["status"],
+                "message": f"task '{task_id}' has no live agent — POST /tasks/{task_id}/start to revive it",
+            },
+        )
     if not spawner.channel_healthy(task_id):
         raise HTTPException(
-            status_code=502,
-            detail=f"task '{task_id}' channel not reachable via session-bridge",
+            status_code=503,
+            detail={
+                "code": "channel_not_ready",
+                "message": f"task '{task_id}' is up but its channel is not registered with session-bridge yet — retry shortly",
+            },
         )
 
     delivered = spawner.post_to_channel(
         task_id, body.text, body.from_session or "taskpilot-daemon"
     )
-    return {"delivered": delivered}
+    if not delivered:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "delivery_failed",
+                "message": f"session-bridge did not accept the message for '{task_id}'",
+            },
+        )
+    return {"ok": True, "delivered": True, "task_id": task_id}
+
+
+# --- Deprecated aliases (kept for one release) ---
+
+
+@app.post("/tasks/{task_id}/spawn", deprecated=True)
+def spawn_alias(task_id: str) -> dict:
+    """Deprecated alias for POST /tasks/{id}/start."""
+    return _start(task_id, None)
+
+
+@app.post("/tasks/{task_id}/kill", deprecated=True)
+def kill_alias(task_id: str) -> dict:
+    """Deprecated alias for POST /tasks/{id}/stop."""
+    return _stop(task_id)
+
+
+@app.post("/tasks/create_and_spawn", deprecated=True)
+def create_and_spawn(body: CreateSpawnRequest) -> dict:
+    """Deprecated composite: PUT /tasks/{id} + POST /tasks/{id}/start in one
+    round trip. The task_id is slugified from `name` (or the description), so
+    callers that predict the id locally get the same value back. Idempotent:
+    re-posting updates the definition and ensures the agent is running (an
+    already-running agent is NOT re-prompted)."""
+    task_id = spawner.slugify(body.name or body.description[:80])
+    _upsert(task_id, TaskDefinition(
+        description=body.description, name=body.name,
+        cwd=body.cwd, model=body.model, brief=body.brief,
+    ))
+    return _start(task_id, None)
 
 
 # --- Boot-persistence service ---
