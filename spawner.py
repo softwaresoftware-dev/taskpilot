@@ -19,6 +19,10 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 TASKPILOT_DIR = Path(os.environ.get("TASKPILOT_DATA_DIR", str(Path.home() / ".taskpilot")))
+# When set, agents are spawned with HOME overridden to this path.
+# The path should contain a minimal ~/.claude with workspace-specific settings.json
+# and a symlink to ~/.claude/plugins so installed plugins remain accessible.
+TASKPILOT_AGENT_HOME = os.environ.get("TASKPILOT_AGENT_HOME", "")
 CLAUDE_JSON = Path.home() / ".claude.json"
 SESSION_NAMESPACE = "taskpilot"
 
@@ -239,7 +243,8 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     #   SESSION_NAMESPACE — same
     #   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false — no human is at the keyboard
     #     in a spawned agent, so the forked-suggestion LLM call is pure waste.
-    cmd = f"""export TASKPILOT_TASK_ID={task_id}
+    home_override = f"export HOME={TASKPILOT_AGENT_HOME}\n" if TASKPILOT_AGENT_HOME else ""
+    cmd = f"""{home_override}export TASKPILOT_TASK_ID={task_id}
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
