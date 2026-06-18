@@ -18,7 +18,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-TASKPILOT_DIR = Path.home() / ".taskpilot"
+TASKPILOT_DIR = Path(os.environ.get("TASKPILOT_DATA_DIR", str(Path.home() / ".taskpilot")))
 CLAUDE_JSON = Path.home() / ".claude.json"
 SESSION_NAMESPACE = "taskpilot"
 

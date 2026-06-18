@@ -1,11 +1,13 @@
 """SQLite storage layer for taskpilot."""
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-DEFAULT_DB_PATH = Path.home() / ".taskpilot" / "taskpilot.db"
+_data_dir = Path(os.environ.get("TASKPILOT_DATA_DIR", str(Path.home() / ".taskpilot")))
+DEFAULT_DB_PATH = _data_dir / "taskpilot.db"
 PORT_RANGE_START = 9100
 
 
