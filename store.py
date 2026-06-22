@@ -49,6 +49,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             invocation_count INTEGER DEFAULT 0,
             model TEXT DEFAULT NULL,
             cwd TEXT DEFAULT NULL,
+            home TEXT DEFAULT NULL,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         )
@@ -63,6 +64,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         ("operating_brief", "ALTER TABLE tasks ADD COLUMN operating_brief TEXT DEFAULT '{}'"),
         ("model", "ALTER TABLE tasks ADD COLUMN model TEXT DEFAULT NULL"),
         ("cwd", "ALTER TABLE tasks ADD COLUMN cwd TEXT DEFAULT NULL"),
+        ("home", "ALTER TABLE tasks ADD COLUMN home TEXT DEFAULT NULL"),
     ):
         try:
             conn.execute(f"SELECT {col} FROM tasks LIMIT 1")
@@ -96,13 +98,14 @@ def create_task(
     operating_brief: dict | None = None,
     model: str | None = None,
     cwd: str | None = None,
+    home: str | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, status, port, plugins, operating_brief, model, cwd)
-           VALUES (?, ?, ?, 'defined', ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, status, port, plugins, operating_brief, model, cwd, home)
+           VALUES (?, ?, ?, 'defined', ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
-         json.dumps(plugins or []), json.dumps(operating_brief or {}), model, cwd),
+         json.dumps(plugins or []), json.dumps(operating_brief or {}), model, cwd, home),
     )
     conn.commit()
     return get_task(conn, task_id)
@@ -117,15 +120,16 @@ def update_definition(
     operating_brief: dict | None = None,
     model: str | None = None,
     cwd: str | None = None,
+    home: str | None = None,
 ) -> None:
     """Replace a task's definition in place (PUT semantics). Status and
     invocation history are untouched."""
     conn.execute(
         """UPDATE tasks SET name = ?, description = ?, plugins = ?,
-           operating_brief = ?, model = ?, cwd = ?, updated_at = datetime('now')
+           operating_brief = ?, model = ?, cwd = ?, home = ?, updated_at = datetime('now')
            WHERE task_id = ?""",
         (name, description, json.dumps(plugins or []),
-         json.dumps(operating_brief or {}), model, cwd, task_id),
+         json.dumps(operating_brief or {}), model, cwd, home, task_id),
     )
     conn.commit()
 

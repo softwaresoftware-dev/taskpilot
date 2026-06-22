@@ -73,6 +73,7 @@ class TaskDefinition(BaseModel):
     description: str
     name: str | None = None
     cwd: str | None = None
+    home: str | None = None
     model: str | None = None
     brief: dict | None = None
     plugins: list[str] | None = None
@@ -98,6 +99,7 @@ class CreateSpawnRequest(BaseModel):
     description: str
     name: str | None = None
     cwd: str | None = None
+    home: str | None = None
     model: str | None = None
     brief: dict | None = None
 
@@ -182,14 +184,14 @@ def _upsert(task_id: str, body: TaskDefinition) -> tuple[dict, bool]:
             store.update_definition(
                 conn, task_id, name=name, description=body.description,
                 plugins=body.plugins, operating_brief=body.brief,
-                model=body.model, cwd=body.cwd,
+                model=body.model, cwd=body.cwd, home=body.home,
             )
             task = store.get_task(conn, task_id)
             created = False
         else:
             task = store.create_task(
                 conn, task_id, name, body.description,
-                body.plugins or [], body.brief or {}, body.model, body.cwd,
+                body.plugins or [], body.brief or {}, body.model, body.cwd, body.home,
             )
             created = True
     spawner.write_task_config(task_id, name, body.description,
@@ -225,6 +227,7 @@ def _start(task_id: str, prompt: str | None) -> dict:
         plugins = json.loads(task["plugins"]) if task["plugins"] else []
         success = spawner.spawn_tmux(
             task_id, plugins, model=task.get("model"), cwd=task.get("cwd"),
+            home=task.get("home"),
         )
         if not success:
             raise HTTPException(
@@ -431,7 +434,7 @@ def create_and_spawn(body: CreateSpawnRequest) -> dict:
     task_id = spawner.slugify(body.name or body.description[:80])
     _upsert(task_id, TaskDefinition(
         description=body.description, name=body.name,
-        cwd=body.cwd, model=body.model, brief=body.brief,
+        cwd=body.cwd, home=body.home, model=body.model, brief=body.brief,
     ))
     return _start(task_id, None)
 

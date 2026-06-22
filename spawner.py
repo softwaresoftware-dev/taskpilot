@@ -213,7 +213,7 @@ def cleanup_project_mcps(task_id: str) -> None:
 
 
 def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
-               cwd: str | None = None) -> bool:
+               cwd: str | None = None, home: str | None = None) -> bool:
     """Launch the Claude session in tmux. Messaging goes through session-bridge.
 
     The agent inherits the user's real ~/.claude environment (global CLAUDE.md,
@@ -243,7 +243,13 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     #   SESSION_NAMESPACE — same
     #   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false — no human is at the keyboard
     #     in a spawned agent, so the forked-suggestion LLM call is pure waste.
-    home_override = f"export HOME={TASKPILOT_AGENT_HOME}\n" if TASKPILOT_AGENT_HOME else ""
+    # Per-task HOME (a workspace partition) takes precedence over the daemon-wide
+    # TASKPILOT_AGENT_HOME fallback. This is what lets ONE taskpilot serve every
+    # workspace: the agent's $HOME is its workspace partition, so it loads that
+    # workspace's MCPs (.claude.json), connector skills (.claude/skills), and
+    # vault (~/.mindframe/vault) — and nothing from any other workspace.
+    eff_home = home or TASKPILOT_AGENT_HOME
+    home_override = f"export HOME={eff_home}\n" if eff_home else ""
     cmd = f"""{home_override}export TASKPILOT_TASK_ID={task_id}
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
