@@ -250,7 +250,14 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     # vault (~/.mindframe/vault) — and nothing from any other workspace.
     eff_home = home or TASKPILOT_AGENT_HOME
     home_override = f"export HOME={eff_home}\n" if eff_home else ""
-    cmd = f"""{home_override}export TASKPILOT_TASK_ID={task_id}
+    # Spawned agents run on the Claude Code subscription. A stray (often invalid)
+    # ANTHROPIC_API_KEY in the inherited env takes precedence over the
+    # subscription login and silently breaks the agent, so clear it per-spawn —
+    # robust no matter how the daemon's environment was created. Opt out with
+    # TASKPILOT_KEEP_API_KEY=1 if an agent should use key-based auth instead.
+    scrub = "" if os.environ.get("TASKPILOT_KEEP_API_KEY") else \
+        "unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN\n"
+    cmd = f"""{home_override}{scrub}export TASKPILOT_TASK_ID={task_id}
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
