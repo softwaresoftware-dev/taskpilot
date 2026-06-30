@@ -23,7 +23,6 @@ TASKPILOT_DIR = Path(os.environ.get("TASKPILOT_DATA_DIR", str(Path.home() / ".ta
 # The path should contain a minimal ~/.claude with workspace-specific settings.json
 # and a symlink to ~/.claude/plugins so installed plugins remain accessible.
 TASKPILOT_AGENT_HOME = os.environ.get("TASKPILOT_AGENT_HOME", "")
-CLAUDE_JSON = Path.home() / ".claude.json"
 SESSION_NAMESPACE = "taskpilot"
 
 # URL of the local session-bridge daemon. Honors session-bridge's own
@@ -188,28 +187,6 @@ If state.json exists, read it first to understand your previous progress, then c
 
     return "\n\n".join(sections) + "\n"
 
-
-def cleanup_project_mcps(task_id: str) -> None:
-    """Remove any project-scoped MCPs this task registered into ~/.claude.json.
-
-    Project MCPs are registered at startup from the task cwd's
-    .claude/settings.json (names recorded in project_mcps.json). We
-    remove them when the task is torn down.
-    """
-    pmcps_file = task_dir(task_id) / "project_mcps.json"
-    if not pmcps_file.exists():
-        return
-    try:
-        names = json.loads(pmcps_file.read_text())
-    except Exception:
-        return
-    if not names:
-        return
-    data = json.loads(CLAUDE_JSON.read_text())
-    mcps = data.get("mcpServers", {})
-    for name in names:
-        mcps.pop(name, None)
-    CLAUDE_JSON.write_text(json.dumps(data, indent=2))
 
 
 def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,

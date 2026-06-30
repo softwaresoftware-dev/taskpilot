@@ -262,7 +262,6 @@ def _stop(task_id: str) -> dict:
     task = _get_or_404(task_id)
     with _task_lock(task_id):
         tmux_killed = spawner.kill_tmux(task_id)
-        spawner.cleanup_project_mcps(task_id)
         # Only a task that has actually run becomes "stopped"; a defined or
         # completed row keeps its status.
         new_status = task["status"]
@@ -358,7 +357,6 @@ def delete_task(task_id: str) -> dict:
         return {"ok": True, "task_id": task_id, "deleted": False, "existed": False}
     with _task_lock(task_id):
         spawner.kill_tmux(task_id)
-        spawner.cleanup_project_mcps(task_id)
         with store.db() as conn:
             store.delete_task(conn, task_id)
         shutil.rmtree(spawner.task_dir(task_id), ignore_errors=True)
