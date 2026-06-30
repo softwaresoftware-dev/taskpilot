@@ -77,7 +77,6 @@ def rt(tmp_path, monkeypatch):
                "post_to_channel", "send_initial_prompt"):
         monkeypatch.setattr(spawner, fn, getattr(fake, fn))
     monkeypatch.setattr(spawner, "write_task_config", lambda *a, **k: tmp_path)
-    monkeypatch.setattr(spawner, "cleanup_project_mcps", lambda task_id: None)
     monkeypatch.setattr(spawner, "task_dir", lambda task_id: tmp_path / task_id)
     monkeypatch.setattr(store, "DEFAULT_DB_PATH", tmp_path / "test.db")
     daemon._locks.clear()
