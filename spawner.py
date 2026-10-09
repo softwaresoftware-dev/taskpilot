@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -189,6 +190,86 @@ If state.json exists, read it first to understand your previous progress, then c
 
 
 
+# Managed-settings locations (Claude Code reads these machine-wide policies).
+_MANAGED_SETTINGS = {
+    "darwin": "/Library/Application Support/ClaudeCode/managed-settings.json",
+    "win32": r"C:\Program Files\ClaudeCode\managed-settings.json",
+}.get(sys.platform, "/etc/claude-code/managed-settings.json")
+
+
+def channel_flag(plugin: str = "session-bridge",
+                 marketplace: str = "softwaresoftware-plugins",
+                 managed_path: str = _MANAGED_SETTINGS) -> str:
+    """The flag that loads the session-bridge channel.
+
+    `--channels` (no startup warning) only works for allowlisted channel
+    plugins. Use it when a managed policy enables channels and allowlists
+    session-bridge; otherwise fall back to the development-channels flag,
+    whose warning dialog wait_for_ready() dismisses.
+    """
+    try:
+        with open(managed_path) as f:
+            policy = json.load(f)
+    except (OSError, ValueError):
+        policy = {}
+    allowed = policy.get("allowedChannelPlugins") or []
+    if policy.get("channelsEnabled") and any(
+        a.get("plugin") == plugin and a.get("marketplace") == marketplace
+        for a in allowed if isinstance(a, dict)
+    ):
+        return "--channels"
+    return "--dangerously-load-development-channels"
+
+
+# Startup dialogs an unattended session can hit: (detector, accept-option label).
+# The highlighted default is NOT reliably the accept option — the trust dialog
+# defaults to "No, exit" — so the option is chosen by its label.
+_STARTUP_DIALOGS = {
+    "trust": (re.compile(r"Quick safety check", re.I), "Yes, I trust this folder"),
+    "dev-channels": (re.compile(r"Loading development channels", re.I),
+                     "I am using this for local development"),
+}
+_CURSOR = "❯"
+_PROMPT_READY = re.compile(r"^\s*❯", re.M)
+
+
+def _select_option(session: str, pane: str, label: str) -> None:
+    """Move the dialog cursor onto the option labelled `label`, then Enter."""
+    lines = pane.splitlines()
+    cur = next((i for i, ln in enumerate(lines) if ln.lstrip().startswith(_CURSOR)), None)
+    want = next((i for i, ln in enumerate(lines) if label in ln), None)
+    keys = []
+    if cur is not None and want is not None and want != cur:
+        keys = ["Down" if want > cur else "Up"] * abs(want - cur)
+    subprocess.run(["tmux", "send-keys", "-t", session, *keys, "Enter"])
+
+
+def wait_for_ready(session: str, timeout: float = 45.0) -> bool:
+    """Dismiss whatever startup dialogs actually appear, until the prompt is up.
+
+    Replaces fixed sleeps + blind Enters: with pre-trusted dirs and an
+    allowlisted channel no dialog appears and this returns in a few seconds.
+    """
+    deadline = time.monotonic() + timeout
+    answered: set[str] = set()
+    while time.monotonic() < deadline:
+        pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", session],
+                              capture_output=True, text=True).stdout
+        dialog = next((k for k, (rx, _) in _STARTUP_DIALOGS.items() if rx.search(pane)), None)
+        if dialog:
+            if dialog not in answered:
+                log.info("%s: accepting %s dialog", session, dialog)
+                answered.add(dialog)
+            _select_option(session, pane, _STARTUP_DIALOGS[dialog][1])
+            time.sleep(1.5)
+            continue
+        if _PROMPT_READY.search(pane):
+            return True
+        time.sleep(0.5)
+    log.warning("%s: prompt not ready after %.0fs", session, timeout)
+    return False
+
+
 def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
                cwd: str | None = None, home: str | None = None) -> bool:
     """Launch the Claude session in tmux. Messaging goes through session-bridge.
@@ -213,6 +294,7 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     # dangerously-load flag bypasses the channel allowlist for inbound
     # notifications. It's a hard dependency, so it's always installed.
     channels_arg = "plugin:session-bridge@softwaresoftware-plugins"
+    channels_flag = channel_flag()
 
     # Env exports:
     #   TASKPILOT_TASK_ID — for capability plugins that scope storage per task
@@ -239,7 +321,7 @@ export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
 cd {td} && claude --dangerously-skip-permissions \\
-  --dangerously-load-development-channels {channels_arg} \\
+  {channels_flag} {channels_arg} \\
   {plugin_flags}{model_flag} \\
   --name {task_id}"""
 
@@ -251,13 +333,7 @@ cd {td} && claude --dangerously-skip-permissions \\
     if result.returncode != 0:
         return False
 
-    # Auto-accept trust dialog (option 1, "Yes, I trust this folder", is default).
-    time.sleep(7)
-    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
-
-    # Auto-accept channels warning (default option is fine here)
-    time.sleep(4)
-    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
+    wait_for_ready(session)
 
     # Best-effort wait for session-bridge to register the channel by name.
     # Channel registration is eventually-consistent: channel.mjs re-registers

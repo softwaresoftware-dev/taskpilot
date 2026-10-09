@@ -106,7 +106,14 @@ foreground with `python daemon.py`. Tail logs with
 - Messaging routes through the session-bridge daemon at `http://127.0.0.1:8910`.
 - The lifecycle service lives in `taskpilot-daemon` at `http://127.0.0.1:8912`.
 - Project-scoped MCPs from the task's `cwd/.claude/settings.json` are registered into `~/.claude.json` at launch (and cleaned up on kill via `project_mcps.json`).
-- Trust dialog + channels warning auto-accepted via `tmux send-keys Enter`.
+- Startup dialogs: `wait_for_ready()` watches the pane and answers only the
+  dialogs that actually appear, choosing the accept option **by label** (the
+  trust dialog defaults to "No, exit" — a blind Enter kills the agent). With
+  the task dir trusted (`projects["~/.taskpilot"].hasTrustDialogAccepted` in
+  `~/.claude.json` covers every non-repo task dir) and session-bridge
+  allowlisted by a managed policy (`channelsEnabled` + `allowedChannelPlugins`),
+  `channel_flag()` picks `--channels` and no dialog appears at all; otherwise
+  it falls back to `--dangerously-load-development-channels`.
 
 ## Agent environment
 
