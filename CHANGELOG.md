@@ -2,6 +2,23 @@
 
 All notable changes to taskpilot.
 
+## 0.16.0 — 2026-10-19
+
+### Added
+
+- **Sandbox mode** (`sandbox` on PUT /tasks, create_and_spawn and the MCP
+  `define_task`): the agent runs with `--restricted` file tools in its cwd, its
+  channel (reply only) and an optional allowlisted `http` tool
+  (`sandbox_http.py`) instead of `--dangerously-skip-permissions` and the
+  user's full environment. For agents that read untrusted input. Credentials
+  for the http tool stay in `~/.taskpilot/.sandbox/<id>/`, outside the
+  agent's reach, and are masked in API responses.
+
+### Fixed
+
+- The daemon API tests' fake spawner accepts `home`, so the suite runs again
+  (15 tests had been failing since `home` was added).
+
 ## 0.15.0 — 2026-06-11
 
 API rearchitecture: resource-oriented, idempotent, truth-telling. The old API

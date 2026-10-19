@@ -41,6 +41,78 @@ def slugify(name: str) -> str:
     return slug[:50]
 
 
+# Sandboxed tasks keep their launch files (MCP config, settings, the HTTP
+# tool's credentials) here — outside every task dir and every agent cwd, so a
+# sandboxed agent's file tools (confined to its cwd) can never read them.
+SANDBOX_DIR = TASKPILOT_DIR / ".sandbox"
+SANDBOX_TOOLS = {"Read", "Glob", "Grep", "Write", "Edit", "TodoWrite"}   # nothing that runs code or reaches the web
+SANDBOX_DEFAULT_TOOLS = ["Read", "Glob", "Grep"]
+CHANNEL_PLUGIN = "session-bridge@softwaresoftware-plugins"
+CHANNEL_TOOLS = "mcp__plugin_session-bridge_session-bridge__"
+
+
+def sandbox_dir(task_id: str) -> Path:
+    return SANDBOX_DIR / task_id
+
+
+def _private_write(path: Path, data: dict) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+
+
+def sandbox_launch(task_id: str, sandbox: dict) -> tuple[str, str]:
+    """Write a sandboxed task's private launch files and return (env exports,
+    claude flags).
+
+    The agent gets: only the built-in tools in `sandbox["tools"]` (file tools,
+    confined by --restricted to its cwd), its session-bridge channel with
+    `reply` only (no `message`/`sessions` — it cannot reach other sessions),
+    and, when `sandbox["http"]` is set, one `http` tool limited to the listed
+    method + path prefixes on one base URL (sandbox_http.py adds the headers,
+    so the agent never sees the credential). No Bash, no web, none of the
+    user's MCP servers or claude.ai connectors, no user/project settings or
+    hooks, and anything else is denied without a prompt (dontAsk)."""
+    tools = sandbox.get("tools") or SANDBOX_DEFAULT_TOOLS
+    bad = sorted(set(tools) - SANDBOX_TOOLS)
+    if bad:
+        raise ValueError(f"sandbox tools not allowed: {', '.join(bad)}")
+    d = sandbox_dir(task_id)
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(SANDBOX_DIR, 0o700)
+    os.chmod(d, 0o700)
+    servers: dict = {}
+    allowed = [f"{CHANNEL_TOOLS}reply"]
+    if sandbox.get("http"):
+        _private_write(d / "http.json", sandbox["http"])
+        servers["sandbox"] = {
+            "command": sys.executable,
+            "args": [str(Path(__file__).resolve().parent / "sandbox_http.py")],
+            "env": {"TASKPILOT_SANDBOX_HTTP": str(d / "http.json")},
+        }
+        allowed.append("mcp__sandbox__http")
+    _private_write(d / "mcp.json", {"mcpServers": servers})
+    # --restricted ignores user settings, which is where the channel plugin is
+    # enabled; enable exactly that one plugin here.
+    _private_write(d / "settings.json", {"enabledPlugins": {CHANNEL_PLUGIN: True}})
+    env = "export ENABLE_CLAUDEAI_MCP_SERVERS=false\n"
+    flags = (f"--restricted --tools {','.join(tools)} --permission-mode dontAsk "
+             f"--mcp-config {d / 'mcp.json'} --settings {d / 'settings.json'} "
+             f"--allowedTools {' '.join(allowed)} "
+             f"--disallowedTools {CHANNEL_TOOLS}message {CHANNEL_TOOLS}sessions")
+    return env, flags
+
+
+def redact_sandbox(raw: str | dict | None) -> dict | None:
+    """A sandbox spec safe to return from the API: header values masked."""
+    if not raw:
+        return None
+    sb = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    if sb.get("http"):
+        sb["http"] = {**sb["http"], "headers": {k: "…" for k in (sb["http"].get("headers") or {})}}
+    return sb
+
+
 def task_dir(task_id: str) -> Path:
     return TASKPILOT_DIR / task_id
 
@@ -271,11 +343,14 @@ def wait_for_ready(session: str, timeout: float = 45.0) -> bool:
 
 
 def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
-               cwd: str | None = None, home: str | None = None) -> bool:
+               cwd: str | None = None, home: str | None = None,
+               sandbox: dict | None = None) -> bool:
     """Launch the Claude session in tmux. Messaging goes through session-bridge.
 
-    The agent inherits the user's real ~/.claude environment (global CLAUDE.md,
-    rules, installed plugins, registered MCP servers).
+    Unsandboxed, the agent inherits the user's real ~/.claude environment
+    (global CLAUDE.md, rules, installed plugins, registered MCP servers) and
+    skips every permission check. With `sandbox`, see sandbox_launch: file
+    tools in its cwd, its channel, and at most one allowlisted HTTP tool.
     """
     session = tmux_session_name(task_id)
     # Default cwd is the task dir; an explicit cwd points the agent at a real
@@ -284,8 +359,9 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
 
     # Build plugin-dir flags
     plugin_flags = ""
-    for p in plugins:
+    for p in plugins if not sandbox else []:   # a sandbox loads no extra plugins
         plugin_flags += f" --plugin-dir {p}"
+    sandbox_env, perm_flags = sandbox_launch(task_id, sandbox) if sandbox else ("", "--dangerously-skip-permissions")
 
     model_flag = f" --model {model}" if model else ""
 
@@ -320,7 +396,7 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
-cd {td} && claude --dangerously-skip-permissions \\
+{sandbox_env}cd {td} && claude {perm_flags} \\
   {channels_flag} {channels_arg} \\
   {plugin_flags}{model_flag} \\
   --name {task_id}"""

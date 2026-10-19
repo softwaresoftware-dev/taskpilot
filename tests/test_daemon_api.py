@@ -46,7 +46,8 @@ class FakeRuntime:
     def is_tmux_alive(self, task_id):
         return task_id in self.alive
 
-    def spawn_tmux(self, task_id, plugins, model=None, cwd=None):
+    def spawn_tmux(self, task_id, plugins, model=None, cwd=None, home=None, sandbox=None):
+        self.spawned = {"task_id": task_id, "home": home, "sandbox": sandbox}
         if not self.spawn_ok:
             return False
         self.alive.add(task_id)

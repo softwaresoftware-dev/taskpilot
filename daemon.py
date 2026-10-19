@@ -53,7 +53,7 @@ import spawner
 import store
 
 DEFAULT_PORT = 8912
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 
 log = logging.getLogger("taskpilot.daemon")
 
@@ -68,6 +68,30 @@ class HealthResponse(BaseModel):
     total: int
 
 
+class SandboxHttp(BaseModel):
+    """The sandboxed agent's one HTTP door: `allow` is [method, path prefix]
+    pairs on `base`; `headers` (e.g. a bearer token) are added by the tool and
+    never shown to the agent."""
+    base: str
+    allow: list[tuple[str, str]]
+    headers: dict[str, str] = {}
+
+
+class Sandbox(BaseModel):
+    """Run the agent sandboxed (see spawner.sandbox_launch). `tools` is a
+    subset of spawner.SANDBOX_TOOLS (default Read, Glob, Grep)."""
+    tools: list[str] | None = None
+    http: SandboxHttp | None = None
+
+    def spec(self) -> dict:
+        bad = sorted(set(self.tools or []) - spawner.SANDBOX_TOOLS)
+        if bad:
+            raise HTTPException(status_code=422, detail=f"sandbox tools not allowed: {', '.join(bad)}")
+        if self.http and not self.http.base.startswith(("http://", "https://")):
+            raise HTTPException(status_code=422, detail="sandbox http.base must be an http(s) URL")
+        return self.model_dump(exclude_none=True)
+
+
 class TaskDefinition(BaseModel):
     """The desired definition of a task — the body of PUT /tasks/{id}."""
     description: str
@@ -77,6 +101,7 @@ class TaskDefinition(BaseModel):
     model: str | None = None
     brief: dict | None = None
     plugins: list[str] | None = None
+    sandbox: Sandbox | None = None
 
 
 class StartRequest(BaseModel):
@@ -102,6 +127,7 @@ class CreateSpawnRequest(BaseModel):
     home: str | None = None
     model: str | None = None
     brief: dict | None = None
+    sandbox: Sandbox | None = None
 
 
 app = FastAPI(title="taskpilot-daemon")
@@ -160,6 +186,7 @@ def _enrich(task: dict) -> dict:
     """Reconcile status with ground truth and add live health fields."""
     _reconcile(task)
     task["channel_healthy"] = spawner.channel_healthy(task["task_id"])
+    task["sandbox"] = spawner.redact_sandbox(task.get("sandbox"))
     return task
 
 
@@ -178,13 +205,14 @@ def _upsert(task_id: str, body: TaskDefinition) -> tuple[dict, bool]:
     """Create or update a task definition row + its config files.
     Returns (task, created)."""
     name = body.name or body.description[:80]
+    sandbox = body.sandbox.spec() if body.sandbox else None
     with store.db() as conn:
         existing = store.get_task(conn, task_id)
         if existing:
             store.update_definition(
                 conn, task_id, name=name, description=body.description,
                 plugins=body.plugins, operating_brief=body.brief,
-                model=body.model, cwd=body.cwd, home=body.home,
+                model=body.model, cwd=body.cwd, home=body.home, sandbox=sandbox,
             )
             task = store.get_task(conn, task_id)
             created = False
@@ -192,6 +220,7 @@ def _upsert(task_id: str, body: TaskDefinition) -> tuple[dict, bool]:
             task = store.create_task(
                 conn, task_id, name, body.description,
                 body.plugins or [], body.brief or {}, body.model, body.cwd, body.home,
+                sandbox,
             )
             created = True
     spawner.write_task_config(task_id, name, body.description,
@@ -228,6 +257,7 @@ def _start(task_id: str, prompt: str | None) -> dict:
         success = spawner.spawn_tmux(
             task_id, plugins, model=task.get("model"), cwd=task.get("cwd"),
             home=task.get("home"),
+            sandbox=json.loads(task["sandbox"]) if task.get("sandbox") else None,
         )
         if not success:
             raise HTTPException(
@@ -331,6 +361,7 @@ def put_task(task_id: str, body: TaskDefinition) -> dict:
         )
     task, created = _upsert(task_id, body)
     task["created"] = created
+    task["sandbox"] = spawner.redact_sandbox(task.get("sandbox"))
     return task
 
 
@@ -360,6 +391,7 @@ def delete_task(task_id: str) -> dict:
         with store.db() as conn:
             store.delete_task(conn, task_id)
         shutil.rmtree(spawner.task_dir(task_id), ignore_errors=True)
+        shutil.rmtree(spawner.sandbox_dir(task_id), ignore_errors=True)
     return {"ok": True, "task_id": task_id, "deleted": True, "existed": True}
 
 
@@ -433,6 +465,7 @@ def create_and_spawn(body: CreateSpawnRequest) -> dict:
     _upsert(task_id, TaskDefinition(
         description=body.description, name=body.name,
         cwd=body.cwd, home=body.home, model=body.model, brief=body.brief,
+        sandbox=body.sandbox,
     ))
     return _start(task_id, None)
 

@@ -58,6 +58,7 @@ def define_task(
     operating_brief: dict | None = None,
     model: str | None = None,
     cwd: str | None = None,
+    sandbox: dict | None = None,
 ) -> dict:
     """Define (or redefine) an autonomous task. Idempotent — defining an
     existing task updates its definition in place; the new definition applies
@@ -84,6 +85,15 @@ def define_task(
                 agent's CLAUDE.md.
         model: Optional Claude model to use (e.g., "sonnet", "opus", "haiku").
         cwd: Optional working directory for the task (default: ~/.taskpilot/<task_id>/).
+        sandbox: Optional — run the agent sandboxed, for work that reads
+            untrusted input (third-party documents, inbound email). The agent
+            gets only file tools confined to `cwd`, its own channel (reply
+            only), and optionally one HTTP tool. Shape:
+            {"tools": ["Read", "Glob", "Grep"],          # subset of Read/Glob/Grep/Write/Edit/TodoWrite
+             "http": {"base": "http://127.0.0.1:8745",
+                      "allow": [["POST", "/api/x/1"]],     # method + path prefix
+                      "headers": {"Authorization": "Bearer …"}}}  # added by the tool, never shown to the agent
+            No shell, no web, none of the user's MCP servers or plugins.
 
     Returns:
         Task record with task_id and a `created` flag (false = updated).
@@ -96,6 +106,7 @@ def define_task(
         "brief": operating_brief,
         "model": model,
         "cwd": cwd,
+        "sandbox": sandbox,
     })
 
 
