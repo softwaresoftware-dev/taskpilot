@@ -75,7 +75,7 @@ manual restart. It exposes:
 - `GET /health` — daemon status + running/total task counts
 - `GET /tasks[?status=]` — list with reconciled status + live tmux/channel health
 - `GET /tasks/<id>` — task detail + state.json
-- `PUT /tasks/<id>` — upsert the task definition `{description, name?, cwd?, model?, brief?, plugins?}`; the id is a caller-chosen slug
+- `PUT /tasks/<id>` — upsert the task definition `{description, name?, cwd?, model?, brief?, plugins?, home?, sandbox?}`; the id is a caller-chosen slug
 - `POST /tasks/<id>/start` — ensure running (idempotent): no-op if alive, (re)spawn if dead; optional `{prompt}` overrides the starter prompt for this start
 - `POST /tasks/<id>/stop` — ensure stopped (idempotent): kill tmux, clean project MCPs
 - `POST /tasks/<id>/message` — deliver via session-bridge with **verified delivery**; errors carry `detail.code`: 409 `agent_not_running` (start + retry), 503 `channel_not_ready` (retry shortly), 502 `delivery_failed`
@@ -117,12 +117,48 @@ foreground with `python daemon.py`. Tail logs with
 
 ## Agent environment
 
-Each spawned agent inherits the user's real `~/.claude` environment — global
+**Sandboxed tasks** (`sandbox` set, 0.16.0) are the exception — see below.
+Every other spawned agent inherits the user's real `~/.claude` environment — global
 `CLAUDE.md`, rules, every installed plugin's skills, and every registered MCP
 server. It runs with the user's real `$HOME` (no isolation): the agent is the
 same OS user with the same toolchain and credentials. Per-task context comes
 from the `CLAUDE.md` that `write_task_config` drops at the task dir (the
 agent's cwd).
+
+## Sandbox mode
+
+For agents that read untrusted input (third-party documents, inbound email),
+where a prompt injection must not reach the user's shell, files, MCP servers or
+other sessions. Set `sandbox` on the task:
+
+```json
+{"tools": ["Read", "Glob", "Grep"],
+ "http": {"base": "http://127.0.0.1:8745",
+          "allow": [["POST", "/api/deals/7/extractions/3"]],
+          "headers": {"Authorization": "Bearer …"}}}
+```
+
+`spawner.sandbox_launch` replaces `--dangerously-skip-permissions` with
+`--restricted --tools <tools> --permission-mode dontAsk` (no Bash or other
+code-running tools, no WebFetch, file tools confined to `cwd`, user/project
+settings and hooks ignored, anything not pre-approved denied without a
+prompt), `ENABLE_CLAUDEAI_MCP_SERVERS=false` (no claude.ai connectors),
+`--settings` enabling only the session-bridge plugin (restricted mode skips
+user settings, so the channel would not load otherwise), `--allowedTools`
+for the channel's `reply` and the `http` tool, and `--disallowedTools` for the
+channel's `message`/`sessions` (no reaching other sessions). User MCP servers
+do not load under `--restricted`; `plugins` are ignored. `tools` must be a
+subset of `SANDBOX_TOOLS` (422 otherwise).
+
+`sandbox_http.py` is the `http` tool: a stdio MCP server that allows only the
+listed method + path prefixes on `base` (segment-aware, no `..`, no host in
+the path, no redirects, body/reply capped) and adds `headers` itself. Its
+config, `mcp.json` and `settings.json` live in `~/.taskpilot/.sandbox/<id>/`
+(0700/0600) — outside every task dir and cwd, so the agent can use the
+credential but never read it. The API masks header values on every read;
+DELETE removes the dir. Verified 2026-10-19 against Claude Code 2.1.303 and 2.1.304: reads
+outside cwd refused, no shell/web/other-session tools, refused routes never
+leave the box. Re-verify the flag set after a Claude Code upgrade.
 
 ## Data
 
