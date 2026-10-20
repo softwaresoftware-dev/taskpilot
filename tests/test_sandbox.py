@@ -54,6 +54,13 @@ def test_unusable_allow_entries_are_refused_at_put(rt, entry):
     assert r.status_code == 422, entry
 
 
+def test_add_dirs_must_be_absolute(rt, tmp_path):
+    assert _put(sandbox={"add_dirs": ["relative/dir"]}).status_code == 422
+    assert _put(sandbox={"add_dirs": ["/a/../b"]}).status_code == 422
+    r = _put(sandbox={"add_dirs": [str(tmp_path / "intake 3")]})
+    assert r.status_code == 200 and r.json()["sandbox"]["add_dirs"] == [str(tmp_path / "intake 3")]
+
+
 def test_caps_must_be_positive(rt):
     assert _put(sandbox={"http": {"base": "http://127.0.0.1:1", "allow": [], "max_body": 0}}).status_code == 422
     r = _put(sandbox={"http": {"base": "http://127.0.0.1:1", "allow": [], "max_body": 1_000_000}})
@@ -105,7 +112,9 @@ def test_launch_flags_take_away_code_web_and_other_sessions(tmp_path, monkeypatc
         assert f in flags
     assert "ENABLE_CLAUDEAI_MCP_SERVERS=false" in env
     _, bare = spawner.sandbox_launch("job-8", {})
-    assert "--tools Read,Glob,Grep" in bare and "mcp__sandbox__http" not in bare
+    assert "--tools Read,Glob,Grep" in bare and "mcp__sandbox__http" not in bare and "--add-dir" not in bare
+    _, extra = spawner.sandbox_launch("job-6", {"add_dirs": ["/data/intake 3", "/data/deals/7"]})
+    assert "--restricted --add-dir '/data/intake 3' --add-dir /data/deals/7 --tools" in extra
     with pytest.raises(ValueError):
         spawner.sandbox_launch("job-7", {"tools": ["Bash"]})
 

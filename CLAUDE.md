@@ -136,8 +136,12 @@ other sessions. Set `sandbox` on the task:
  "http": {"base": "http://127.0.0.1:8745",
           "allow": [["POST", "/api/deals/7/extractions/3"], ["GET", "/api/deals/7/docs/*"]],
           "headers": {"Authorization": "Bearer …"},
-          "max_body": 1000000}}
+          "max_body": 1000000},
+ "add_dirs": ["/srv/app/uploads/3"]}
 ```
+
+`add_dirs` are extra folders the file tools may read (`--add-dir`; absolute
+paths, validated on PUT). Everything else on disk stays out of reach.
 
 An `allow` entry matches its path exactly; a pattern ending in `/*` also
 matches everything under it (`/*` alone is refused). Methods: GET, POST, PUT,

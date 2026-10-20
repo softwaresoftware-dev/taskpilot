@@ -93,7 +93,8 @@ def define_task(
              "http": {"base": "http://127.0.0.1:8745",
                       "allow": [["POST", "/api/x/1"], ["GET", "/api/x/1/docs/*"]],  # exact, or /* for everything under
                       "headers": {"Authorization": "Bearer …"},   # added by the tool, never shown to the agent
-                      "max_body": 1000000}}                       # optional byte caps (max_body 64 KB, max_reply 32 KB by default)
+                      "max_body": 1000000},                       # optional byte caps (max_body 64 KB, max_reply 32 KB by default)
+             "add_dirs": ["/srv/app/uploads/3"]}                 # extra folders the file tools may read
             No shell, no web, none of the user's MCP servers or plugins.
 
     Returns:

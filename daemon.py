@@ -87,11 +87,15 @@ class Sandbox(BaseModel):
     subset of spawner.SANDBOX_TOOLS (default Read, Glob, Grep)."""
     tools: list[str] | None = None
     http: SandboxHttp | None = None
+    add_dirs: list[str] | None = None    # extra folders the file tools may read (absolute paths)
 
     def spec(self) -> dict:
         bad = sorted(set(self.tools or []) - spawner.SANDBOX_TOOLS)
         if bad:
             raise HTTPException(status_code=422, detail=f"sandbox tools not allowed: {', '.join(bad)}")
+        for p in self.add_dirs or []:
+            if not Path(p).is_absolute() or ".." in Path(p).parts:
+                raise HTTPException(status_code=422, detail=f"sandbox add_dirs entry {p!r} must be an absolute path")
         if self.http:
             if not self.http.base.startswith(("http://", "https://")):
                 raise HTTPException(status_code=422, detail="sandbox http.base must be an http(s) URL")

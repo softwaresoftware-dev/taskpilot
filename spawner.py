@@ -97,7 +97,10 @@ def sandbox_launch(task_id: str, sandbox: dict) -> tuple[str, str]:
     # enabled; enable exactly that one plugin here.
     _private_write(d / "settings.json", {"enabledPlugins": {CHANNEL_PLUGIN: True}})
     env = "export ENABLE_CLAUDEAI_MCP_SERVERS=false\n"
-    flags = (f"--restricted --tools {','.join(tools)} --permission-mode dontAsk "
+    # Extra readable folders (--restricted confines the file tools to cwd plus
+    # these). Absolute paths only; the daemon validates that.
+    add_dirs = "".join(f" --add-dir {shlex.quote(p)}" for p in sandbox.get("add_dirs") or [])
+    flags = (f"--restricted{add_dirs} --tools {','.join(tools)} --permission-mode dontAsk "
              f"--mcp-config {shlex.quote(str(d / 'mcp.json'))} --settings {shlex.quote(str(d / 'settings.json'))} "
              f"--allowedTools {' '.join(allowed)} "
              f"--disallowedTools {CHANNEL_TOOLS}message {CHANNEL_TOOLS}sessions")

@@ -17,6 +17,7 @@ All notable changes to taskpilot.
   matches the paths under it. `http.max_body` / `http.max_reply` set the byte
   caps per task (defaults 64 KB / 32 KB). Entries are validated on PUT
   (method, plain path, no `/*` allow-all).
+- `sandbox.add_dirs`: extra readable folders (`--add-dir`), absolute paths only.
 
 ### Fixed
 
