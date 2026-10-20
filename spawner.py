@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -97,7 +98,7 @@ def sandbox_launch(task_id: str, sandbox: dict) -> tuple[str, str]:
     _private_write(d / "settings.json", {"enabledPlugins": {CHANNEL_PLUGIN: True}})
     env = "export ENABLE_CLAUDEAI_MCP_SERVERS=false\n"
     flags = (f"--restricted --tools {','.join(tools)} --permission-mode dontAsk "
-             f"--mcp-config {d / 'mcp.json'} --settings {d / 'settings.json'} "
+             f"--mcp-config {shlex.quote(str(d / 'mcp.json'))} --settings {shlex.quote(str(d / 'settings.json'))} "
              f"--allowedTools {' '.join(allowed)} "
              f"--disallowedTools {CHANNEL_TOOLS}message {CHANNEL_TOOLS}sessions")
     return env, flags
@@ -360,10 +361,10 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     # Build plugin-dir flags
     plugin_flags = ""
     for p in plugins if not sandbox else []:   # a sandbox loads no extra plugins
-        plugin_flags += f" --plugin-dir {p}"
+        plugin_flags += f" --plugin-dir {shlex.quote(p)}"
     sandbox_env, perm_flags = sandbox_launch(task_id, sandbox) if sandbox else ("", "--dangerously-skip-permissions")
 
-    model_flag = f" --model {model}" if model else ""
+    model_flag = f" --model {shlex.quote(model)}" if model else ""
 
     # session-bridge is the agent's channel — the messaging backbone. Loaded as
     # plugin:session-bridge@softwaresoftware-plugins (marketplace form); the
@@ -384,7 +385,7 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     # workspace's MCPs (.claude.json), connector skills (.claude/skills), and
     # vault (~/.mindframe/vault) — and nothing from any other workspace.
     eff_home = home or TASKPILOT_AGENT_HOME
-    home_override = f"export HOME={eff_home}\n" if eff_home else ""
+    home_override = f"export HOME={shlex.quote(eff_home)}\n" if eff_home else ""
     # Spawned agents run on the Claude Code subscription. A stray (often invalid)
     # ANTHROPIC_API_KEY in the inherited env takes precedence over the
     # subscription login and silently breaks the agent, so clear it per-spawn —
@@ -396,13 +397,15 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
-{sandbox_env}cd {td} && claude {perm_flags} \\
+{sandbox_env}cd {shlex.quote(td)} && exec claude {perm_flags} \\
   {channels_flag} {channels_arg} \\
   {plugin_flags}{model_flag} \\
-  --name {task_id}"""
+  --name {shlex.quote(task_id)}"""
 
+    # cwd/home/model come from the API and are quoted above; the whole script
+    # is quoted once more for the `sh -c` tmux wraps its command in.
     result = subprocess.run(
-        ["tmux", "new-session", "-d", "-s", session, f"bash -lc '{cmd}'"],
+        ["tmux", "new-session", "-d", "-s", session, f"bash -lc {shlex.quote(cmd)}"],
         capture_output=True,
         text=True,
     )
@@ -410,6 +413,11 @@ export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
         return False
 
     wait_for_ready(session)
+    if not is_tmux_alive(task_id):
+        # `cd` failed or claude exited at once: the pane is gone, so this is a
+        # failed spawn, not a running agent that never answers.
+        log.warning("spawn %s: session exited during startup (bad cwd?)", task_id)
+        return False
 
     # Best-effort wait for session-bridge to register the channel by name.
     # Channel registration is eventually-consistent: channel.mjs re-registers

@@ -91,8 +91,9 @@ def define_task(
             only), and optionally one HTTP tool. Shape:
             {"tools": ["Read", "Glob", "Grep"],          # subset of Read/Glob/Grep/Write/Edit/TodoWrite
              "http": {"base": "http://127.0.0.1:8745",
-                      "allow": [["POST", "/api/x/1"]],     # method + path prefix
-                      "headers": {"Authorization": "Bearer …"}}}  # added by the tool, never shown to the agent
+                      "allow": [["POST", "/api/x/1"], ["GET", "/api/x/1/docs/*"]],  # exact, or /* for everything under
+                      "headers": {"Authorization": "Bearer …"},   # added by the tool, never shown to the agent
+                      "max_body": 1000000}}                       # optional byte caps (max_body 64 KB, max_reply 32 KB by default)
             No shell, no web, none of the user's MCP servers or plugins.
 
     Returns:

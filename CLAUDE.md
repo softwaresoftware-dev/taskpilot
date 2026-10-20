@@ -134,9 +134,15 @@ other sessions. Set `sandbox` on the task:
 ```json
 {"tools": ["Read", "Glob", "Grep"],
  "http": {"base": "http://127.0.0.1:8745",
-          "allow": [["POST", "/api/deals/7/extractions/3"]],
-          "headers": {"Authorization": "Bearer …"}}}
+          "allow": [["POST", "/api/deals/7/extractions/3"], ["GET", "/api/deals/7/docs/*"]],
+          "headers": {"Authorization": "Bearer …"},
+          "max_body": 1000000}}
 ```
+
+An `allow` entry matches its path exactly; a pattern ending in `/*` also
+matches everything under it (`/*` alone is refused). Methods: GET, POST, PUT,
+PATCH, DELETE. `max_body`/`max_reply` cap bytes sent/returned (defaults 64 KB
+and 32 KB — a rent-roll extraction needs more). Entries are validated on PUT.
 
 `spawner.sandbox_launch` replaces `--dangerously-skip-permissions` with
 `--restricted --tools <tools> --permission-mode dontAsk` (no Bash or other
@@ -151,14 +157,26 @@ do not load under `--restricted`; `plugins` are ignored. `tools` must be a
 subset of `SANDBOX_TOOLS` (422 otherwise).
 
 `sandbox_http.py` is the `http` tool: a stdio MCP server that allows only the
-listed method + path prefixes on `base` (segment-aware, no `..`, no host in
-the path, no redirects, body/reply capped) and adds `headers` itself. Its
-config, `mcp.json` and `settings.json` live in `~/.taskpilot/.sandbox/<id>/`
+listed routes on `base` and adds `headers` itself. The path grammar is
+deliberately tiny (`PATH_RE`: plain segments of letters, digits, `. _ ~ -`; no
+percent-encoding, query string, `;`, backslash, `.`/`..` segments), so the
+path it checks is byte-for-byte the path it sends — the server never gets a
+chance to decode its way past the allowlist. No redirects. Its config,
+`mcp.json` and `settings.json` live in `~/.taskpilot/.sandbox/<id>/`
 (0700/0600) — outside every task dir and cwd, so the agent can use the
 credential but never read it. The API masks header values on every read;
-DELETE removes the dir. Verified 2026-10-19 against Claude Code 2.1.303 and 2.1.304: reads
-outside cwd refused, no shell/web/other-session tools, refused routes never
-leave the box. Re-verify the flag set after a Claude Code upgrade.
+stop and DELETE remove the dir. Verified 2026-10-19 against Claude Code
+2.1.303 and 2.1.304: reads outside cwd refused, no shell/web/other-session
+tools, refused routes never leave the box, a `CLAUDE.md`/`.mcp.json` in cwd
+and the user's `~/.claude/CLAUDE.md` are not loaded. The "no user MCP
+servers" property is observed, not documented (`--help` says to add
+`--strict-mcp-config`, which drops the channel plugin), so re-verify the
+flag set and the tool list after a Claude Code upgrade.
+
+The credential in `http.json` is whatever the caller passes: the sandbox
+limits routes, but the token itself is honoured by the target server however
+it likes. Callers should mint a token scoped to the task (one deal, those
+routes, an expiry) rather than hand over a master token.
 
 ## Data
 

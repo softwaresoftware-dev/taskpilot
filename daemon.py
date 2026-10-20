@@ -49,6 +49,7 @@ from pydantic import BaseModel
 
 # We're a sibling of server.py / spawner.py / store.py
 sys.path.insert(0, str(Path(__file__).parent))
+import sandbox_http
 import spawner
 import store
 
@@ -69,12 +70,16 @@ class HealthResponse(BaseModel):
 
 
 class SandboxHttp(BaseModel):
-    """The sandboxed agent's one HTTP door: `allow` is [method, path prefix]
-    pairs on `base`; `headers` (e.g. a bearer token) are added by the tool and
-    never shown to the agent."""
+    """The sandboxed agent's one HTTP door: `allow` is [method, pattern] pairs
+    on `base` (a pattern matches exactly; one ending in /* also matches the
+    paths under it); `headers` (e.g. a bearer token) are added by the tool and
+    never shown to the agent. `max_body`/`max_reply` are byte caps on what the
+    agent may send and gets back (defaults in sandbox_http)."""
     base: str
     allow: list[tuple[str, str]]
     headers: dict[str, str] = {}
+    max_body: int | None = None
+    max_reply: int | None = None
 
 
 class Sandbox(BaseModel):
@@ -87,8 +92,16 @@ class Sandbox(BaseModel):
         bad = sorted(set(self.tools or []) - spawner.SANDBOX_TOOLS)
         if bad:
             raise HTTPException(status_code=422, detail=f"sandbox tools not allowed: {', '.join(bad)}")
-        if self.http and not self.http.base.startswith(("http://", "https://")):
-            raise HTTPException(status_code=422, detail="sandbox http.base must be an http(s) URL")
+        if self.http:
+            if not self.http.base.startswith(("http://", "https://")):
+                raise HTTPException(status_code=422, detail="sandbox http.base must be an http(s) URL")
+            for m, p in self.http.allow:
+                why = sandbox_http.check_pattern(m, p)
+                if why:
+                    raise HTTPException(status_code=422, detail=f"sandbox http.allow entry [{m}, {p}]: {why}")
+            for k, v in (("max_body", self.http.max_body), ("max_reply", self.http.max_reply)):
+                if v is not None and v < 1:
+                    raise HTTPException(status_code=422, detail=f"sandbox http.{k} must be a positive byte count")
         return self.model_dump(exclude_none=True)
 
 
@@ -292,6 +305,10 @@ def _stop(task_id: str) -> dict:
     task = _get_or_404(task_id)
     with _task_lock(task_id):
         tmux_killed = spawner.kill_tmux(task_id)
+        # A sandboxed task's launch files hold its credential; they are only
+        # needed while the agent runs (start rewrites them), so drop them now
+        # rather than leaving a token on disk until someone DELETEs the task.
+        shutil.rmtree(spawner.sandbox_dir(task_id), ignore_errors=True)
         # Only a task that has actually run becomes "stopped"; a defined or
         # completed row keeps its status.
         new_status = task["status"]

@@ -79,6 +79,7 @@ def rt(tmp_path, monkeypatch):
         monkeypatch.setattr(spawner, fn, getattr(fake, fn))
     monkeypatch.setattr(spawner, "write_task_config", lambda *a, **k: tmp_path)
     monkeypatch.setattr(spawner, "task_dir", lambda task_id: tmp_path / task_id)
+    monkeypatch.setattr(spawner, "SANDBOX_DIR", tmp_path / ".sandbox")   # stop/delete rmtree stays in tmp
     monkeypatch.setattr(store, "DEFAULT_DB_PATH", tmp_path / "test.db")
     daemon._locks.clear()
     return fake

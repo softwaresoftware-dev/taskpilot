@@ -13,8 +13,22 @@ All notable changes to taskpilot.
   user's full environment. For agents that read untrusted input. Credentials
   for the http tool stay in `~/.taskpilot/.sandbox/<id>/`, outside the
   agent's reach, and are masked in API responses.
+- `http.allow` entries match a path exactly; a pattern ending in `/*` also
+  matches the paths under it. `http.max_body` / `http.max_reply` set the byte
+  caps per task (defaults 64 KB / 32 KB). Entries are validated on PUT
+  (method, plain path, no `/*` allow-all).
 
 ### Fixed
+
+- The `http` tool accepts only a plain path grammar (letters, digits,
+  `/ . _ ~ -`): no percent-encoding, query strings, `;` parameters or
+  backslashes, so the path it checks is byte-for-byte the one it sends and
+  the server has nothing to re-interpret (review 2026-10-19).
+- Stopping a sandboxed task removes its launch files (the credential) rather
+  than leaving them until DELETE.
+- `cwd`, `home`, `model` and plugin dirs are shell-quoted in the tmux launch
+  command; a session that exits during startup (bad cwd) is reported as a
+  failed spawn instead of a running task.
 
 - The daemon API tests' fake spawner accepts `home`, so the suite runs again
   (15 tests had been failing since `home` was added).
