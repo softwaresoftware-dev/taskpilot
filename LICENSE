@@ -1,15 +1,15 @@
 SOFTWARESOFTWARE PLUGIN LICENSE
 
-Copyright (c) 2026 NOV LLC. All rights reserved.
+Copyright (c) 2026 GRAV LLC. All rights reserved.
 
 This license governs the `taskpilot` plugin (the "Plugin") published by
-NOV LLC at `https://github.com/softwaresoftware-dev/taskpilot`, and all
+GRAV LLC at `https://github.com/softwaresoftware-dev/taskpilot`, and all
 source code, documentation, configuration, skills, rules, hooks, and any
 other files distributed within the Plugin's repository (collectively, the
 "Software").
 
-The Software is the proprietary property of NOV LLC, a Colorado
-limited-liability company, and its owner Thatcher Thornberry. All rights not
+The Software is the proprietary property of GRAV LLC, a Texas
+limited-liability company, and its members. All rights not
 expressly granted below are reserved.
 
 ## 1. Permitted Use
@@ -28,7 +28,7 @@ Subject to the restrictions in Section 2, you are permitted to:
 
 ## 2. Prohibited Use
 
-Except with prior written permission from NOV LLC, you may NOT:
+Except with prior written permission from GRAV LLC, you may NOT:
 
   a. Modify, adapt, translate, or create derivative works from the Software.
 
@@ -46,14 +46,14 @@ Except with prior written permission from NOV LLC, you may NOT:
   e. Remove, obscure, or alter any copyright notice, trademark, attribution,
      or other proprietary marking.
 
-  f. Use the name "softwaresoftware", "NOV LLC", "taskpilot", or any
+  f. Use the name "softwaresoftware", "GRAV LLC", "taskpilot", or any
      associated mark, to endorse, promote, or imply association with
      derivative or third-party works.
 
 ## 3. Commercial Licensing
 
 Any commercial use of the Software requires a separate paid license agreement
-with NOV LLC. To negotiate commercial terms, contact the owner in writing.
+with GRAV LLC. To negotiate commercial terms, contact the owner in writing.
 
 ## 4. Third-Party Components
 
@@ -66,8 +66,8 @@ rights to, or imposes restrictions on, such third-party works.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL NOV
-LLC OR ITS OWNER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL GRAV
+LLC OR ITS MEMBERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
 WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF,
 OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
 
@@ -86,6 +86,6 @@ Colorado.
 
 ---
 
-Copyright (c) 2026 NOV LLC. All rights reserved.
+Copyright (c) 2026 GRAV LLC. All rights reserved.
 The authoritative template for this license is maintained at
 `nov-llc/licenses/softwaresoftware-plugin-license-template.md`.
