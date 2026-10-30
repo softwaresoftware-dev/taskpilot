@@ -9,6 +9,7 @@ network. These tests pin the 0.15.0 API contract:
   - reads reconcile stored status against tmux ground truth.
   - /message verifies delivery and fails with actionable codes.
   - DELETE frees the id for reuse.
+  - prune deletes finished tasks past retention, never running or `keep` ones.
   - legacy status values migrate on open.
 """
 
@@ -252,6 +253,61 @@ def test_delete_frees_the_id(rt):
 def test_delete_absent_task_is_noop(rt):
     r = client.delete("/tasks/ghost")
     assert r.status_code == 200 and r.json()["existed"] is False
+
+
+# --------------------------- prune (retention) ---------------------------
+
+
+def _age(tid, days):
+    with store.db() as conn:
+        conn.execute("UPDATE tasks SET updated_at = datetime('now', ?) WHERE task_id = ?",
+                     (f"-{days} days", tid))
+        conn.commit()
+
+
+def test_prune_deletes_only_idle_finished_tasks(rt):
+    _put("old-stopped"); client.post("/tasks/old-stopped/start"); client.post("/tasks/old-stopped/stop")
+    _put("old-defined")
+    _put("fresh-stopped"); client.post("/tasks/fresh-stopped/start"); client.post("/tasks/fresh-stopped/stop")
+    _put("old-running"); client.post("/tasks/old-running/start")
+    for tid in ("old-stopped", "old-defined", "old-running"):
+        _age(tid, 10)
+    r = client.post("/tasks/prune", json={"older_than_days": 7})
+    assert r.status_code == 200
+    assert sorted(r.json()["deleted"]) == ["old-defined", "old-stopped"]
+    assert client.get("/tasks/old-stopped").status_code == 404
+    assert client.get("/tasks/fresh-stopped").status_code == 200
+    assert client.get("/tasks/old-running").json()["status"] == "running"
+
+
+def test_prune_skips_a_stale_row_whose_agent_is_alive(rt):
+    _put(); client.post("/tasks/job-1/start"); client.post("/tasks/job-1/stop")
+    _age("job-1", 10)
+    rt.alive.add("job-1")    # tmux came back behind the daemon's back
+    assert client.post("/tasks/prune", json={"older_than_days": 7}).json()["deleted"] == []
+    assert client.get("/tasks/job-1").json()["status"] == "running"
+
+
+def test_keep_exempts_and_survives_a_redefine(rt):
+    _put(keep=True)
+    _put(desc="v2")    # a caller that doesn't know about keep must not unpin it
+    _age("job-1", 30)
+    assert client.get("/tasks/job-1").json()["keep"] is True
+    assert client.post("/tasks/prune", json={"older_than_days": 1}).json()["deleted"] == []
+    _put(keep=False)
+    _age("job-1", 30)
+    assert client.post("/tasks/prune", json={"older_than_days": 1}).json()["deleted"] == ["job-1"]
+
+
+def test_prune_dry_run_deletes_nothing(rt):
+    _put(); _age("job-1", 10)
+    r = client.post("/tasks/prune", json={"older_than_days": 7, "dry_run": True})
+    assert r.json()["deleted"] == ["job-1"] and r.json()["dry_run"] is True
+    assert client.get("/tasks/job-1").status_code == 200
+
+
+def test_prune_rejects_non_positive_threshold(rt):
+    assert client.post("/tasks/prune", json={"older_than_days": 0}).status_code == 422
 
 
 # --------------------------- deprecated aliases ---------------------------

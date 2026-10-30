@@ -48,8 +48,13 @@ the resolver accepts the install transparently.
 4. The starter prompt — `start`'s optional `prompt` override, else the stored description — is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
 5. External callers (e.g. the mindframe dashboard's message box) send messages the same way, via `POST /tasks/<id>/message`.
 
-The daemon is **reactive**: it acts on API calls, not on a background timer.
-There is no background reconciler and no completion inference — but every
+The daemon is **reactive**: it acts on API calls. Its one timer is the
+**retention sweep** (hourly): finished tasks — `defined`, `stopped`, `crashed`,
+`completed` — whose row hasn't changed in `TASKPILOT_RETENTION_DAYS` (default
+7; `0` turns the sweep off) are deleted exactly like `DELETE /tasks/<id>`.
+Running tasks and tasks defined with `keep: true` are never pruned; set `keep`
+on a long-lived task that something revives by id with `start` alone. Callers
+that PUT before every start don't need it. There is no background reconciler and no completion inference — but every
 *read* reconciles a task's stored status against tmux ground truth and
 persists the correction: a `running` row whose tmux died reads as `crashed`;
 a `stopped`/`crashed` row whose tmux is somehow alive reads as `running`.
@@ -75,11 +80,12 @@ manual restart. It exposes:
 - `GET /health` — daemon status + running/total task counts
 - `GET /tasks[?status=]` — list with reconciled status + live tmux/channel health
 - `GET /tasks/<id>` — task detail + state.json
-- `PUT /tasks/<id>` — upsert the task definition `{description, name?, cwd?, model?, brief?, plugins?, home?, sandbox?}`; the id is a caller-chosen slug
+- `PUT /tasks/<id>` — upsert the task definition `{description, name?, cwd?, model?, brief?, plugins?, home?, sandbox?, keep?}`; the id is a caller-chosen slug. `keep` omitted on a redefine leaves the flag unchanged
 - `POST /tasks/<id>/start` — ensure running (idempotent): no-op if alive, (re)spawn if dead; optional `{prompt}` overrides the starter prompt for this start
 - `POST /tasks/<id>/stop` — ensure stopped (idempotent): kill tmux, clean project MCPs
 - `POST /tasks/<id>/message` — deliver via session-bridge with **verified delivery**; errors carry `detail.code`: 409 `agent_not_running` (start + retry), 503 `channel_not_ready` (retry shortly), 502 `delivery_failed`
 - `DELETE /tasks/<id>` — stop + delete row + config dir; frees the id (idempotent)
+- `POST /tasks/prune` — run the retention sweep now `{older_than_days?, dry_run?}` → `{deleted: [ids], count}`
 - Deprecated aliases (one release): `POST /tasks/<id>/spawn` → start, `POST /tasks/<id>/kill` → stop, `POST /tasks/create_and_spawn` → PUT + start in one round trip for event-driven callers (the dispatcher's `spawn:<recipe>` path). The task_id is slugified from `name` (or the description); now genuinely idempotent — re-posting updates the definition and ensures running instead of 409ing.
 
 The MCP server (`server.py`) is a thin client: `_daemon_call()` POSTs to the

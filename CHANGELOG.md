@@ -2,6 +2,25 @@
 
 All notable changes to taskpilot.
 
+## 0.17.0 — 2026-10-30
+
+### Added
+
+- **Retention.** The daemon deletes finished tasks (`defined`, `stopped`,
+  `crashed`, `completed`) whose row hasn't changed in
+  `TASKPILOT_RETENTION_DAYS` (default 7; `0` disables) in an hourly sweep.
+  Running tasks are never touched; a candidate whose tmux is alive is
+  reconciled to running and skipped.
+- `keep` on PUT /tasks and the MCP `define_task` exempts a task from
+  retention. Omitting it on a redefine leaves the flag as it was.
+- `POST /tasks/prune {older_than_days?, dry_run?}` and the MCP `prune_tasks`
+  tool run the sweep on demand.
+
+### Why
+
+598 tasks had piled up (mostly eval runs), making `GET /tasks` a 7.9 MB,
+3.4 s response that the platform hub timed out on.
+
 ## 0.16.0 — 2026-10-19
 
 ### Added

@@ -59,6 +59,7 @@ def define_task(
     model: str | None = None,
     cwd: str | None = None,
     sandbox: dict | None = None,
+    keep: bool | None = None,
 ) -> dict:
     """Define (or redefine) an autonomous task. Idempotent — defining an
     existing task updates its definition in place; the new definition applies
@@ -96,6 +97,10 @@ def define_task(
                       "max_body": 1000000},                       # optional byte caps (max_body 64 KB, max_reply 32 KB by default)
              "add_dirs": ["/srv/app/uploads/3"]}                 # extra folders the file tools may read
             No shell, no web, none of the user's MCP servers or plugins.
+        keep: Optional — exempt the task from retention. Finished tasks idle
+            longer than the daemon's retention (7 days by default) are
+            deleted; set this for a long-lived task that something restarts
+            by id. Omit on a redefine to leave it unchanged.
 
     Returns:
         Task record with task_id and a `created` flag (false = updated).
@@ -109,6 +114,7 @@ def define_task(
         "model": model,
         "cwd": cwd,
         "sandbox": sandbox,
+        "keep": keep,
     })
 
 
@@ -209,6 +215,26 @@ def delete_task(task_id: str) -> dict:
         {deleted, existed}.
     """
     return _daemon_call("DELETE", f"/tasks/{task_id}")
+
+
+@mcp.tool()
+def prune_tasks(older_than_days: float | None = None, dry_run: bool = False) -> dict:
+    """Delete finished tasks (defined, stopped, crashed, completed) idle
+    longer than `older_than_days`. Running tasks and tasks defined with
+    `keep` are never touched. The daemon runs this sweep hourly with its
+    configured retention; call it to clean up sooner or to preview.
+
+    Args:
+        older_than_days: Idle threshold (default: the daemon's retention, 7 days).
+        dry_run: List the ids that would be deleted without deleting them.
+
+    Returns:
+        {deleted: [ids], count, dry_run, older_than_days}.
+    """
+    body: dict = {"dry_run": dry_run}
+    if older_than_days is not None:
+        body["older_than_days"] = older_than_days
+    return _daemon_call("POST", "/tasks/prune", json_body=body)
 
 
 if __name__ == "__main__":

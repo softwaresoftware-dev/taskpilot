@@ -51,6 +51,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             cwd TEXT DEFAULT NULL,
             home TEXT DEFAULT NULL,
             sandbox TEXT DEFAULT NULL,
+            keep INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         )
@@ -67,6 +68,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         ("cwd", "ALTER TABLE tasks ADD COLUMN cwd TEXT DEFAULT NULL"),
         ("home", "ALTER TABLE tasks ADD COLUMN home TEXT DEFAULT NULL"),
         ("sandbox", "ALTER TABLE tasks ADD COLUMN sandbox TEXT DEFAULT NULL"),
+        ("keep", "ALTER TABLE tasks ADD COLUMN keep INTEGER DEFAULT 0"),
     ):
         try:
             conn.execute(f"SELECT {col} FROM tasks LIMIT 1")
@@ -102,14 +104,15 @@ def create_task(
     cwd: str | None = None,
     home: str | None = None,
     sandbox: dict | None = None,
+    keep: bool = False,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, status, port, plugins, operating_brief, model, cwd, home, sandbox)
-           VALUES (?, ?, ?, 'defined', ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, status, port, plugins, operating_brief, model, cwd, home, sandbox, keep)
+           VALUES (?, ?, ?, 'defined', ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
          json.dumps(plugins or []), json.dumps(operating_brief or {}), model, cwd, home,
-         json.dumps(sandbox) if sandbox else None),
+         json.dumps(sandbox) if sandbox else None, int(keep)),
     )
     conn.commit()
     return get_task(conn, task_id)
@@ -126,16 +129,20 @@ def update_definition(
     cwd: str | None = None,
     home: str | None = None,
     sandbox: dict | None = None,
+    keep: bool | None = None,
 ) -> None:
     """Replace a task's definition in place (PUT semantics). Status and
-    invocation history are untouched."""
+    invocation history are untouched. `keep` None leaves the flag as it is, so
+    a caller that predates it can't unpin a task by redefining it."""
     conn.execute(
         """UPDATE tasks SET name = ?, description = ?, plugins = ?,
-           operating_brief = ?, model = ?, cwd = ?, home = ?, sandbox = ?, updated_at = datetime('now')
+           operating_brief = ?, model = ?, cwd = ?, home = ?, sandbox = ?,
+           keep = COALESCE(?, keep), updated_at = datetime('now')
            WHERE task_id = ?""",
         (name, description, json.dumps(plugins or []),
          json.dumps(operating_brief or {}), model, cwd, home,
-         json.dumps(sandbox) if sandbox else None, task_id),
+         json.dumps(sandbox) if sandbox else None,
+         None if keep is None else int(keep), task_id),
     )
     conn.commit()
 
@@ -144,6 +151,24 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete a task row, freeing its id for reuse."""
     conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
     conn.commit()
+
+
+def prune_candidates(conn: sqlite3.Connection, older_than_days: float,
+                     task_id: str | None = None) -> list[str]:
+    """Ids of tasks the retention policy may delete: not running, not
+    `keep`, and untouched (no status change or redefinition) for longer than
+    `older_than_days`. `task_id` re-checks just that one. The caller still
+    checks tmux before deleting."""
+    rows = conn.execute(
+        """SELECT task_id FROM tasks
+           WHERE status IN ('defined', 'stopped', 'crashed', 'completed')
+             AND COALESCE(keep, 0) = 0
+             AND updated_at < datetime('now', ?)
+             AND (? IS NULL OR task_id = ?)
+           ORDER BY updated_at""",
+        (f"-{older_than_days * 86400:.0f} seconds", task_id, task_id),
+    ).fetchall()
+    return [r["task_id"] for r in rows]
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> dict | None:

@@ -22,6 +22,9 @@ The API is resource-oriented and idempotent:
     channel hasn't registered yet (retryable), 502 when the channel POST
     failed. A 200 means session-bridge accepted the message for this agent.
   - DELETE stops the task and frees its id for reuse.
+  - Retention: finished tasks (defined/stopped/crashed/completed) untouched
+    for TASKPILOT_RETENTION_DAYS (default 7) are deleted hourly, unless
+    defined with `keep`. POST /tasks/prune runs the same sweep on demand.
 
 Status values: defined → running → (crashed | stopped | completed). Legacy
 rows ('pending', 'killed') are migrated on open by store._ensure_schema.
@@ -32,7 +35,7 @@ POST /tasks/{id}/kill → stop, POST /tasks/create_and_spawn → PUT + start.
 
 The daemon installs as a boot-persistence service through the daemon
 capability (daemon-manager); see `skills/setup/SKILL.md`. It is reactive:
-it acts on API calls, not on a background timer.
+it acts on API calls; its one timer is the retention sweep.
 """
 
 import json
@@ -54,7 +57,9 @@ import spawner
 import store
 
 DEFAULT_PORT = 8912
-VERSION = "0.16.0"
+VERSION = "0.17.0"
+RETENTION_DAYS = float(os.environ.get("TASKPILOT_RETENTION_DAYS", "7"))   # 0 turns the hourly sweep off
+PRUNE_EVERY_S = 3600
 
 log = logging.getLogger("taskpilot.daemon")
 
@@ -119,6 +124,14 @@ class TaskDefinition(BaseModel):
     brief: dict | None = None
     plugins: list[str] | None = None
     sandbox: Sandbox | None = None
+    keep: bool | None = None    # exempt from retention; None on a redefine leaves it as it was
+
+
+class PruneRequest(BaseModel):
+    """POST /tasks/prune. `older_than_days` defaults to the daemon's
+    retention; `dry_run` lists what would go without deleting it."""
+    older_than_days: float | None = None
+    dry_run: bool = False
 
 
 class StartRequest(BaseModel):
@@ -204,6 +217,7 @@ def _enrich(task: dict) -> dict:
     _reconcile(task)
     task["channel_healthy"] = spawner.channel_healthy(task["task_id"])
     task["sandbox"] = spawner.redact_sandbox(task.get("sandbox"))
+    task["keep"] = bool(task.get("keep"))
     return task
 
 
@@ -230,6 +244,7 @@ def _upsert(task_id: str, body: TaskDefinition) -> tuple[dict, bool]:
                 conn, task_id, name=name, description=body.description,
                 plugins=body.plugins, operating_brief=body.brief,
                 model=body.model, cwd=body.cwd, home=body.home, sandbox=sandbox,
+                keep=body.keep,
             )
             task = store.get_task(conn, task_id)
             created = False
@@ -237,7 +252,7 @@ def _upsert(task_id: str, body: TaskDefinition) -> tuple[dict, bool]:
             task = store.create_task(
                 conn, task_id, name, body.description,
                 body.plugins or [], body.brief or {}, body.model, body.cwd, body.home,
-                sandbox,
+                sandbox, bool(body.keep),
             )
             created = True
     spawner.write_task_config(task_id, name, body.description,
@@ -408,12 +423,63 @@ def delete_task(task_id: str) -> dict:
     if not task:
         return {"ok": True, "task_id": task_id, "deleted": False, "existed": False}
     with _task_lock(task_id):
-        spawner.kill_tmux(task_id)
-        with store.db() as conn:
-            store.delete_task(conn, task_id)
-        shutil.rmtree(spawner.task_dir(task_id), ignore_errors=True)
-        shutil.rmtree(spawner.sandbox_dir(task_id), ignore_errors=True)
+        _forget(task_id)
     return {"ok": True, "task_id": task_id, "deleted": True, "existed": True}
+
+
+def _forget(task_id: str) -> None:
+    """Kill, drop the row, remove the config + sandbox dirs. Caller holds the task lock."""
+    spawner.kill_tmux(task_id)
+    with store.db() as conn:
+        store.delete_task(conn, task_id)
+    shutil.rmtree(spawner.task_dir(task_id), ignore_errors=True)
+    shutil.rmtree(spawner.sandbox_dir(task_id), ignore_errors=True)
+
+
+def _prune(older_than_days: float, dry_run: bool = False) -> dict:
+    """Delete finished tasks idle longer than `older_than_days`. A candidate
+    whose tmux turns out to be alive is reconciled to running and skipped, and
+    one redefined or restarted since the query (updated_at moved) is left alone."""
+    with store.db() as conn:
+        ids = store.prune_candidates(conn, older_than_days)
+    deleted: list[str] = []
+    for task_id in ids:
+        with _task_lock(task_id):
+            with store.db() as conn:
+                task = store.get_task(conn, task_id)
+                if not task or not store.prune_candidates(conn, older_than_days, task_id):
+                    continue
+            if _reconcile(task)["tmux_alive"]:
+                continue
+            if not dry_run:
+                _forget(task_id)
+            deleted.append(task_id)
+    if deleted and not dry_run:
+        log.info("pruned %d task(s) idle > %g days", len(deleted), older_than_days)
+    return {"ok": True, "dry_run": dry_run, "older_than_days": older_than_days,
+            "deleted": deleted, "count": len(deleted)}
+
+
+@app.post("/tasks/prune")
+def prune(body: PruneRequest | None = None) -> dict:
+    """Run the retention sweep now: delete every finished task (defined /
+    stopped / crashed / completed, not `keep`) idle longer than
+    `older_than_days` (default: the daemon's TASKPILOT_RETENTION_DAYS).
+    `dry_run` returns the ids without deleting."""
+    body = body or PruneRequest()
+    days = body.older_than_days if body.older_than_days is not None else RETENTION_DAYS
+    if days <= 0:
+        raise HTTPException(status_code=422, detail="older_than_days must be positive")
+    return _prune(days, body.dry_run)
+
+
+def _retention_loop() -> None:
+    while True:
+        try:
+            _prune(RETENTION_DAYS)
+        except Exception:
+            log.exception("retention sweep failed")
+        threading.Event().wait(PRUNE_EVERY_S)
 
 
 @app.post("/tasks/{task_id}/message")
@@ -530,6 +596,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(message)s",
     )
+    if RETENTION_DAYS > 0:
+        threading.Thread(target=_retention_loop, name="retention", daemon=True).start()
     uvicorn.run(app, host=bind, port=port, log_level="info")
 
 
